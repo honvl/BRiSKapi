@@ -412,3 +412,13 @@ test('fetchCatchUp names its own problem when no format is configured', async ()
   await assert.rejects(fetchCatchUp({}, { app: { series: 0, date: '2021-09-27' }, issues: [{ issue_id: 1, from: 1, to: 2 }] }),
     /1 issues behind the stream.*POST \/api\/stocks_update.*not public/s);
 });
+
+test('a live() that fails leaves no timers behind, so the process can exit', { skip: !cache }, async () => {
+  const { files } = demo();
+  const timers = () => process.getActiveResourcesInfo().filter(name => name === 'Timeout').length;
+  const before = timers();
+  const broken = class { constructor() { throw new Error('socket constructor failed'); } };
+  await assert.rejects(live({ cookies: { s: 'v' }, emit: async () => {}, protocolVersion: 16000,
+    fetchImpl: server(files).fetchImpl, WebSocketImpl: broken }), /socket constructor failed/);
+  assert.equal(timers(), before, 'the heartbeat monitor and the start timer were stopped');
+});

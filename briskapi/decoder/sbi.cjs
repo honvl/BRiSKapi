@@ -140,10 +140,10 @@ async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImp
     link?.close();
     settle({ code: -1, reason: '' });
   };
-  const monitor = heartbeatMonitor({ intervalMs: heartbeatMs, checkEveryMs: Math.min(1000, heartbeatMs / 4), onFail: fail });
+  let monitor = null, timer = null;  // started with the link and always stopped, so a failure cannot leave the process hanging
   const decoder = await Decoder.create(assets, { protocolVersion, check: checkAbi, callbacks: {
     send: bytes => { if (link) link.send(bytes); },
-    heartbeat: () => monitor.beat(),
+    heartbeat: () => monitor?.beat(),
     authError: () => fail(new Error('SBI BRiSK reports another WebSocket session for this user (only one is allowed); close the other one')),
     marketFinished: () => { marketFinished = true; },
   } });
@@ -170,8 +170,6 @@ async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImp
 
   let seq = 0, frames = 0, updates = 0, started = false, starting = false, work = Promise.resolve();
   const start = performance.now();
-  const timer = setTimeout(() => fail(new Error(`SBI BRiSK stream did not initialize within ${startTimeoutMs / 1000}s; `
-    + 'no first frame numbers arrived (run with --trace-protocol to see what the server sent)')), startTimeoutMs);
 
   const finishStart = caughtUp => {
     clearTimeout(timer);
@@ -230,23 +228,30 @@ async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImp
     } catch (error) { fail(error); }
   };
 
-  link = new Link({ WebSocketImpl, url: new URL(app.ws_url, ORIGIN.replace('https:', 'wss:')),
-    headers: { cookie: session.cookie }, profile, context, trace, connectTimeoutMs, onBinary: onFrame,
-    onClose: closed => settle(closed), onError: error => { failure = failure || error; settle({ code: -1, reason: '' }); } });
+  try {
+    monitor = heartbeatMonitor({ intervalMs: heartbeatMs, checkEveryMs: Math.min(1000, heartbeatMs / 4), onFail: fail });
+    timer = setTimeout(() => fail(new Error(`SBI BRiSK stream did not initialize within ${startTimeoutMs / 1000}s; `
+      + 'no first frame numbers arrived (run with --trace-protocol to see what the server sent)')), startTimeoutMs);
+    link = new Link({ WebSocketImpl, url: new URL(app.ws_url, ORIGIN.replace('https:', 'wss:')),
+      headers: { cookie: session.cookie }, profile, context, trace, connectTimeoutMs, onBinary: onFrame,
+      onClose: closed => settle(closed), onError: error => { failure = failure || error; settle({ code: -1, reason: '' }); } });
 
-  const closed = await ended;
-  clearTimeout(timer);
-  monitor.stop();
-  // A catch-up that finishes extends the chain (it queues the bootstrap), so wait until it stops growing.
-  for (let pending = null; pending !== work;) { pending = work; await pending; }
-  if (failure) throw failure;
-  if ((closed.code !== 1000 && !marketFinished) || !started) {
-    throw new Error(`SBI BRiSK stream closed (${closed.code} ${closed.reason || ''})`.trim());
+    const closed = await ended;
+    // A catch-up that finishes extends the chain (it queues the bootstrap), so wait until it stops growing.
+    for (let pending = null; pending !== work;) { pending = work; await pending; }
+    if (failure) throw failure;
+    if ((closed.code !== 1000 && !marketFinished) || !started) {
+      throw new Error(`SBI BRiSK stream closed (${closed.code} ${closed.reason || ''})`.trim());
+    }
+    const summary = { type: 'end', seq, source_time_us: decoder.time(), frames, quote_updates: updates,
+      replay_wall_ms: performance.now() - start };
+    await emit(summary);
+    return summary;
+  } finally {
+    clearTimeout(timer);
+    monitor?.stop();
+    link?.close();
   }
-  const summary = { type: 'end', seq, source_time_us: decoder.time(), frames, quote_updates: updates,
-    replay_wall_ms: performance.now() - start };
-  await emit(summary);
-  return summary;
 }
 
 const USAGE = 'Usage: BRISK_SBI_COOKIES=... sbi.cjs [--codes 7203,6758] [--trace-protocol]';

@@ -2,6 +2,7 @@
 // The BRiSK WebSocket link against a scripted fake server: plain binary frames (Next) and
 // the Engine.IO / Socket.IO dialect upstream documents for SBI. No account or network.
 const test = require('node:test');
+const { afterEach } = test;
 const assert = require('node:assert/strict');
 const { Link, SBI_PROFILE, resolveProfile, heartbeatMonitor, redact } = require('../../briskapi/decoder/engineio.cjs');
 
@@ -33,6 +34,10 @@ async function until(condition, what, ms = 1000) {
 const CTX = { marketToken: 'v2.local.MARKETTOKEN', identity: 'a'.repeat(64), wsSession: 'b'.repeat(40),
   tabId: 'tab-1', origin: 'https://sbi.brisk.jp' };
 
+// Links keep their keepalive timers referenced, so every test closes what it opened.
+const opened = [];
+afterEach(() => { for (const socket of opened.splice(0)) socket.close(); });
+
 function open(overrides = {}) {
   const seen = { binary: [], errors: [], closes: [], trace: [] };
   const link = new Link({
@@ -41,6 +46,7 @@ function open(overrides = {}) {
     onBinary: data => seen.binary.push(data), onError: error => seen.errors.push(error),
     onClose: close => seen.closes.push(close), trace: line => seen.trace.push(line), ...overrides,
   });
+  opened.push(FakeSocket.last);
   return { link, seen, socket: FakeSocket.last };
 }
 

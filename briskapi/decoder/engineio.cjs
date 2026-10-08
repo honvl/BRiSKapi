@@ -95,9 +95,10 @@ class Link {
     try { fn(); } catch (error) { this.fail(error); }
   }
 
+  // Timers stay referenced on purpose: a live session in progress must keep the process
+  // alive, and finish() clears every one of them.
   timer(fn, ms, repeat = false) {
     const handle = (repeat ? setInterval : setTimeout)(() => this.guard(fn), ms);
-    handle.unref?.();
     this.timers.add(handle);
     return handle;
   }
@@ -254,7 +255,6 @@ function heartbeatMonitor({ intervalMs = 7000, checkEveryMs = 1000, onFail, now 
       onFail(new Error(`SBI BRiSK connection check failure: no heartbeat for ${Math.round((now() - last) / 1000)}s`));
     }
   }, checkEveryMs);
-  timer.unref?.();
   return { beat() { last = now(); }, stop() { clearInterval(timer); } };
 }
 
