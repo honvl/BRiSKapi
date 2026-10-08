@@ -248,14 +248,38 @@ class Link {
 
 // The vendor client closes the connection when its last heartbeat is older than 7 s, but
 // only once it has seen one. Beats come from the WASM's heartbeat callback.
-function heartbeatMonitor({ intervalMs = 7000, checkEveryMs = 1000, onFail, now = () => performance.now() }) {
+function heartbeatMonitor({ intervalMs = 7000, checkEveryMs = 1000, onFail, now = () => performance.now(), staleCheck = null }) {
   let last = null;
   const timer = setInterval(() => {
     if (last !== null && now() - last > intervalMs) {
       onFail(new Error(`SBI BRiSK connection check failure: no heartbeat for ${Math.round((now() - last) / 1000)}s`));
     }
+    const stale = staleCheck?.();
+    if (stale) onFail(stale);
   }, checkEveryMs);
   return { beat() { last = now(); }, stop() { clearInterval(timer); } };
 }
 
-module.exports = { Link, SBI_PROFILE, resolveProfile, heartbeatMonitor, redact };
+// The vendor client's second liveness rule: during trading hours (08:00-15:00 JST, not the
+// 11:30-12:10 break) the decoder's data time must not lag the server clock by more than 90 s.
+// The server clock comes from the heartbeat; nothing is checked before the first one, or on a
+// day other than the market date.
+function staleDataCheck({ date, thresholdUs = 90_000_000, now = Date.now }) {
+  let server = null;
+  return {
+    beat(ns) { server = { serverMs: Number(ns / 1_000_000n), localMs: now() }; },
+    check(decoderTimeUs) {
+      if (!server || !decoderTimeUs) return null;
+      const jst = new Date(server.serverMs + (now() - server.localMs) + 9 * 3600e3);
+      if (jst.toISOString().slice(0, 10) !== date) return null;
+      const hour = jst.getUTCHours(), minute = jst.getUTCMinutes();
+      if (hour >= 15 || hour <= 7 || (hour === 11 && minute >= 30) || (hour === 12 && minute < 10)) return null;
+      const lag = 1e6 * (60 * (60 * hour + minute) + jst.getUTCSeconds()) - decoderTimeUs;
+      return lag > thresholdUs
+        ? new Error(`SBI BRiSK data is stale: the decoder's clock is ${Math.round(lag / 1e6)}s behind the server (limit ${thresholdUs / 1e6}s)`)
+        : null;
+    },
+  };
+}
+
+module.exports = { Link, SBI_PROFILE, resolveProfile, heartbeatMonitor, staleDataCheck, redact };

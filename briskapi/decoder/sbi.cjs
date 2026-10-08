@@ -13,7 +13,7 @@
 const crypto = require('node:crypto');
 const { once } = require('node:events');
 const { Decoder } = require('./decoder.cjs');
-const { Link, resolveProfile, heartbeatMonitor, redact } = require('./engineio.cjs');
+const { Link, resolveProfile, heartbeatMonitor, staleDataCheck, redact } = require('./engineio.cjs');
 
 const ORIGIN = 'https://sbi.brisk.jp';
 const PROTOCOL_VERSION = 18000;
@@ -113,21 +113,51 @@ async function decoderAssets(session) {
   throw new Error('SBI BRiSK decoder not found in the app bundles; the site layout may have changed');
 }
 
+// The master's record layout also depends on the protocol version, and SBI's is not independently
+// confirmed. A wrong layout would read tick types as codes, limits as lot sizes and so on, so
+// refuse a master that does not look like a market. (The 2021 demo's passes every test at 99.98%.)
+function checkMaster(master, protocolVersion) {
+  const fraction = predicate => master.filter(predicate).length / (master.length || 1);
+  const problems = [];
+  if (master.length < 1000) problems.push(`only ${master.length} issues`);
+  const rules = [
+    ['numeric codes', 0.95, m => /^\d{3,4}$/.test(m.code)],
+    ['positive base prices', 0.98, m => m.base_price10 > 0],
+    ['limits around the base price', 0.98, m => m.limit_up10 > m.base_price10 && m.base_price10 > m.limit_down10],
+    ['lot sizes of 1 to 1,000,000', 0.98, m => m.lot_size >= 1 && m.lot_size <= 1e6],
+    ['names', 0.95, m => m.name.length > 0],
+  ];
+  for (const [what, minimum, predicate] of rules) {
+    const seen = fraction(predicate);
+    if (seen < minimum) problems.push(`${what}: ${(100 * seen).toFixed(1)}% (need ${(100 * minimum).toFixed(0)}%)`);
+  }
+  const distinct = new Set(master.map(m => m.code)).size / (master.length || 1);
+  if (distinct < 0.99) problems.push(`distinct codes: ${(100 * distinct).toFixed(1)}% (need 99%)`);
+  if (problems.length) {
+    throw new Error(`SBI BRiSK stock master layout not recognised for protocol ${protocolVersion}: ${problems.join('; ')}`);
+  }
+}
+
 function checkAbi(wasm) {
   const missing = REQUIRED.filter(name => typeof wasm[name] !== 'function');
   if (missing.length) throw new Error(`SBI BRiSK decoder changed; missing ${missing.join(', ')}`);
 }
 
 async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImpl = WebSocket, startTimeoutMs = 60000,
-  protocolVersion = PROTOCOL_VERSION, profile: overrides = {}, trace = null, catchUp = null, heartbeatMs = 7000,
-  connectTimeoutMs = 15000, catchUpBackoffMs }) {
+  protocolVersion, profile: overrides = {}, trace = null, catchUp = null, heartbeatMs = 7000,
+  staleSeconds = 90, connectTimeoutMs = 15000, catchUpBackoffMs }) {
   const profile = resolveProfile(overrides);
   const session = new Session(cookies, fetchImpl);
   const began = performance.now();
   const frontend = await session.get('/api/frontend/boot');
   session.token = frontend.api_token;
   const app = await session.get('/api/app/boot');
-  trace?.(`boot: date ${app.date}, series ${app.series}, ws_url ${redact(app.ws_url)}`);
+  // The server says which decoder protocol it speaks (the vendor client passes it to the WASM and
+  // falls back to 16000); an explicit option wins, then the boot response, then SBI's 18000.
+  protocolVersion ??= app.flex_version ?? PROTOCOL_VERSION;
+  trace?.(`boot: date ${app.date}, series ${app.series}, flex_version ${protocolVersion}, `
+    + `${(app.base_prices || []).length} base prices, ${(app.exceptional_sq || []).length} exceptional special quotes, `
+    + `ws_url ${redact(app.ws_url)}`);
   const { assets, paths } = await decoderAssets(session);
   assets['master.dat'] = await session.get(`/api/master/${encodeURIComponent(app.master)}`, 'bytes');
   assets['snapshot.dat'] = await session.get(`/api/snapshot/${encodeURIComponent(app.snapshot)}`, 'bytes');
@@ -141,18 +171,22 @@ async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImp
     settle({ code: -1, reason: '' });
   };
   let monitor = null, timer = null;  // started with the link and always stopped, so a failure cannot leave the process hanging
-  const decoder = await Decoder.create(assets, { protocolVersion, check: checkAbi, callbacks: {
+  const stale = staleSeconds ? staleDataCheck({ date: app.date, thresholdUs: staleSeconds * 1e6 }) : null;
+  const decoder = await Decoder.create(assets, { protocolVersion, check: checkAbi,
+    boot: { exceptional_sq: app.exceptional_sq, base_prices: app.base_prices }, callbacks: {
     send: bytes => { if (link) link.send(bytes); },
-    heartbeat: () => monitor?.beat(),
+    heartbeat: ns => { monitor?.beat(); stale?.beat(ns); },
     authError: () => fail(new Error('SBI BRiSK reports another WebSocket session for this user (only one is allowed); close the other one')),
     marketFinished: () => { marketFinished = true; },
   } });
+  checkMaster(decoder.master, protocolVersion);
   const selected = new Set(codes);
   const master = decoder.master.filter(m => !selected.size || selected.has(m.code));
   const missing = codes.filter(code => !master.some(m => m.code === code));
   if (missing.length) throw new Error(`Codes not in the SBI master: ${missing.join(',')}`);
   const ids = new Set(master.map(m => m.issue_id));
   const input_transport = { kind: 'sbi_websocket', origin: ORIGIN + '/', series: app.series,
+    protocol_version: protocolVersion, boot_applied: decoder.boot,
     decoder: paths, decoder_sha256: crypto.createHash('sha256').update(assets['fita.wasm']).digest('hex'),
     setup_ms: performance.now() - began };
 
@@ -209,6 +243,7 @@ async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImp
   const handle = async (frame, received_unix_ms) => {
     const t0 = process.hrtime.bigint();
     decoder.feed(frame);
+    decoder.applyBasePrice();
     const quotes = decoder.changed().filter(id => ids.has(id)).map(id => decoder.quote(id));
     updates += quotes.length;
     await emit({ type: 'quotes', seq: seq++, source_time_us: decoder.time(), received_unix_ms,
@@ -224,12 +259,14 @@ async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImp
     }
     try {
       decoder.feed(frame);
+      decoder.applyBasePrice();
       if (!starting && decoder.initialFrames) { starting = true; begin(); }
     } catch (error) { fail(error); }
   };
 
   try {
-    monitor = heartbeatMonitor({ intervalMs: heartbeatMs, checkEveryMs: Math.min(1000, heartbeatMs / 4), onFail: fail });
+    monitor = heartbeatMonitor({ intervalMs: heartbeatMs, checkEveryMs: Math.min(1000, heartbeatMs / 4), onFail: fail,
+      staleCheck: stale && (() => stale.check(decoder.time())) });
     timer = setTimeout(() => fail(new Error(`SBI BRiSK stream did not initialize within ${startTimeoutMs / 1000}s; `
       + 'no first frame numbers arrived (run with --trace-protocol to see what the server sent)')), startTimeoutMs);
     link = new Link({ WebSocketImpl, url: new URL(app.ws_url, ORIGIN.replace('https:', 'wss:')),
@@ -281,7 +318,7 @@ async function main(argv, env = process.env) {
     } });
 }
 
-module.exports = { Session, decoderAssets, checkAbi, live, main, fetchCatchUp, CATCH_UP_FORMATS, PROTOCOL_VERSION, REQUIRED };
+module.exports = { Session, decoderAssets, checkAbi, checkMaster, live, main, fetchCatchUp, CATCH_UP_FORMATS, PROTOCOL_VERSION, REQUIRED };
 if (require.main === module) main(process.argv.slice(2)).catch(error => {
   console.error(error.message); process.exitCode = 1;
 });

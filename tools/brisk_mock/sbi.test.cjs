@@ -5,7 +5,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { Session, checkAbi, live, main, fetchCatchUp } = require('../../briskapi/decoder/sbi.cjs');
+const { Session, checkAbi, checkMaster, live, main, fetchCatchUp } = require('../../briskapi/decoder/sbi.cjs');
 const { frames, Decoder } = require('../../briskapi/decoder/decoder.cjs');
 const cache = process.env.BRISK_MOCK_CACHE;
 
@@ -327,7 +327,8 @@ async function liveWithWasm(files, chunks, options = {}) {
     WebSocketImpl: hook.Socket = engineSocketPlain(chunks), heartbeatMs: 80, ...options,
     emit: async b => { batches.push(b); if (b.type === 'bootstrap') ready(); } });
   hook.batches = batches;
-  hook.restore = () => { Decoder.create = real; };
+  hook.done.catch(() => {});   // a test that fails early must not turn the session's end into an unhandled rejection
+  hook.restore = () => { Decoder.create = real; engineSocketPlain.last?.close(1000); };
   return hook;
 }
 
@@ -421,4 +422,140 @@ test('a live() that fails leaves no timers behind, so the process can exit', { s
   await assert.rejects(live({ cookies: { s: 'v' }, emit: async () => {}, protocolVersion: 16000,
     fetchImpl: server(files).fetchImpl, WebSocketImpl: broken }), /socket constructor failed/);
   assert.equal(timers(), before, 'the heartbeat monitor and the start timer were stopped');
+});
+
+// ---------------------------------------------------------------------------------------
+// Protocol version and boot data from the app boot response, the master guard, the stale rule
+// and the heartbeat/ping loop, against the real decoder.
+
+const bootWith = extra => ({ '/api/app/boot': () => JSON.stringify({ date: '2021-09-27', series: 0, master: 'm1',
+  snapshot: 's1', ws_url: '/realtime/0?session=abc', ...extra }) });
+const quietLive = (files, chunks, extra = {}, options = {}) => live({ cookies: { s: 'v' }, emit: async () => {},
+  fetchImpl: server(files, bootWith(extra)).fetchImpl, WebSocketImpl: socketFrom(chunks), ...options });
+
+test('the protocol version comes from the boot response unless an option overrides it', { skip: !cache }, async () => {
+  const { files, chunks } = demo();
+  const batches = [];
+  await quietLive(files, chunks, { flex_version: 16000 }, { emit: async b => batches.push(b) });
+  assert.equal(batches[0].input_transport.protocol_version, 16000);
+  await assert.rejects(quietLive(files, chunks, { flex_version: 18000 }), Error, 'the demo decoder cannot speak 18000');
+  await assert.rejects(quietLive(files, chunks, { flex_version: 17000 }), /layout for protocol 17000 is not known/);
+  const forced = [];
+  await quietLive(files, chunks, { flex_version: 18000 }, { protocolVersion: 16000, emit: async b => forced.push(b) });
+  assert.equal(forced[0].input_transport.protocol_version, 16000, 'an explicit option wins');
+});
+
+test('boot base prices and exceptional special quotes are applied, and bad ones refused', { skip: !cache }, async () => {
+  const { files, chunks } = demo();
+  const batches = [];
+  // Values consistent with the demo's snapshot (Toyota's own master limits): the decoder builds its
+  // order-book rows from the limits the snapshot was cut with, and aborts if boot data contradicts them.
+  // That a change is applied is proved at decoder level (decoder.test.cjs); here the plumbing runs end to end.
+  const boot = { flex_version: 16000,
+    base_prices: [{ issue_code: '7203', base_price10: 101000, limit_down10: 71000, limit_up10: 131000 }],
+    exceptional_sq: [{ buy_sell: 'S', jump_range: 10, jump_sec: 180, issue_code: '7203', quote_limit_down: 9900, quote_limit_up: 10400 }] };
+  await quietLive(files, chunks, boot, { codes: ['7203'], emit: async b => batches.push(b) });
+  assert.deepEqual(batches[0].input_transport.boot_applied, { exceptional_sq: 1, base_prices: 1, applied: 1 });
+  assert.equal(batches[0].master[0].limit_up10, 131000);
+  assert.equal(batches[0].quotes[0].indicative_price10, 101500, 'the bootstrap still decodes');
+  await assert.rejects(quietLive(files, chunks, { flex_version: 16000,
+    base_prices: [{ issue_code: '0000', base_price10: 1, limit_down10: 1, limit_up10: 2 }] }),
+  /base_prices names issue code 0000, which is not in the master/);
+});
+
+test('checkMaster accepts a market and refuses a misread master', () => {
+  const issue = i => ({ code: String(1301 + i), base_price10: 30000 + i, limit_up10: 37000 + i, limit_down10: 23000 + i,
+    lot_size: 100, name: 'x' });
+  const good = Array.from({ length: 4000 }, (_, i) => issue(i));
+  assert.doesNotThrow(() => checkMaster(good, 18000));
+  // every field read one word late: tick type as code, base as tick, limits as limits, and so on
+  const shifted = good.map(m => ({ code: '3', base_price10: m.limit_up10, limit_up10: m.limit_down10,
+    limit_down10: m.lot_size, lot_size: 0, name: '' }));
+  assert.throws(() => checkMaster(shifted, 18000), /layout not recognised for protocol 18000: .*numeric codes.*distinct codes/);
+  assert.throws(() => checkMaster(good.slice(0, 10), 18000), /only 10 issues/);
+  assert.throws(() => checkMaster([], 18000), /only 0 issues/);
+});
+
+test('a stale feed is a failure even though heartbeats arrive', { skip: !cache }, async () => {
+  const { files, chunks } = demo();
+  const hook = await liveWithWasm(files, chunks.slice(0, 3), { heartbeatMs: 60000, staleSeconds: 90 });
+  try {
+    await hook.started;
+    const server = BigInt(Date.UTC(2021, 8, 27, 1, 30)) * 1_000_000n;           // 10:30 JST; the demo data is at 09:00
+    hook.wasm.dynCall_viii(hook.pointers[2], hook.decoder.id, Number(server & 0xFFFFFFFFn) | 0, Number(server >> 32n));
+    await assert.rejects(hook.done, /data is stale: the decoder's clock is \d+s behind the server \(limit 90s\)/);
+  } finally { hook.restore(); }
+});
+
+test('a feed that keeps up with the server clock is not stale', { skip: !cache }, async () => {
+  const { files, chunks } = demo();
+  const hook = await liveWithWasm(files, chunks.slice(0, 3), { heartbeatMs: 60000, staleSeconds: 90 });
+  try {
+    await hook.started;
+    const server = BigInt(Date.UTC(2021, 8, 27, 0, 0, 30)) * 1_000_000n;        // 09:00:30 JST, 30 s after the data
+    hook.wasm.dynCall_viii(hook.pointers[2], hook.decoder.id, Number(server & 0xFFFFFFFFn) | 0, Number(server >> 32n));
+    await new Promise(resolve => setTimeout(resolve, 1300));                      // more than one 1 s check
+    hook.wasm.dynCall_vi(hook.pointers[5], hook.decoder.id);                      // marketFinished
+    engineSocketPlain.last.close(1006);
+    assert.equal((await hook.done).type, 'end');
+  } finally { hook.restore(); }
+});
+
+// A server that starts the ping loop and echoes every ping it receives, like the real one.
+function pingingSocket(chunks) {
+  return class extends EventTarget {
+    constructor() {
+      super();
+      this.sent = []; this.closed = false; this.echo = true;
+      pingingSocket.last = this;
+      setImmediate(() => {
+        for (const chunk of chunks) {
+          this.dispatchEvent(new MessageEvent('message', { data: chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.length) }));
+        }
+        setTimeout(() => this.ping(), 20);
+      });
+    }
+    ping() {
+      const frame = Buffer.alloc(9);
+      frame[0] = 0xf0;
+      frame.writeBigUInt64LE(BigInt(Date.now()) * 1_000_000n, 1);
+      this.deliver(frame);
+    }
+    deliver(frame) {
+      this.dispatchEvent(new MessageEvent('message', { data: frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length) }));
+    }
+    send(data) {
+      const frame = Buffer.from(data);
+      this.sent.push(frame);
+      if (this.echo && frame[0] === 0xf0) setTimeout(() => !this.closed && this.deliver(frame), 5);
+    }
+    close(code = 1000) {
+      if (this.closed) return;
+      this.closed = true;
+      this.dispatchEvent(Object.assign(new Event('close'), { code, reason: '' }));
+    }
+  };
+}
+
+test('the ping loop runs through the real decoder: pings are forwarded, echoes beat, silence fails', { skip: !cache }, async () => {
+  const { files, chunks } = demo();
+  const batches = [];
+  const done = live({ cookies: { s: 'v' }, protocolVersion: 16000, heartbeatMs: 400, staleSeconds: 0,
+    fetchImpl: server(files).fetchImpl, WebSocketImpl: pingingSocket(chunks.slice(0, 3)),
+    emit: async b => batches.push(b) });
+  const settled = done.then(() => 'ended', error => error);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 900));            // more than two heartbeat windows
+    const socket = pingingSocket.last;
+    const pings = socket.sent.filter(f => f[0] === 0xf0);
+    assert.ok(pings.length >= 10, `${pings.length} pings were forwarded and echoed`);
+    assert.ok(pings.every(p => p.length === 9));
+    assert.equal(await Promise.race([settled, new Promise(resolve => setTimeout(() => resolve('running'), 10))]), 'running',
+      'the monitor stayed satisfied while echoes arrived');
+    socket.echo = false;                                               // the server goes quiet
+    const error = await settled;
+    assert.match(error.message, /connection check failure: no heartbeat/);
+  } finally {
+    pingingSocket.last?.close(1000);                                   // a failed assertion must not leave a session running
+  }
 });

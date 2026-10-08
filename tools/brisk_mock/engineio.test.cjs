@@ -246,3 +246,50 @@ test('the heartbeat monitor waits for a first beat, then fails when beats stop',
   assert.match(failures[0].message, /connection check failure: no heartbeat for 7s/);
   monitor.stop();
 });
+
+// ---------------------------------------------------------------------------------------
+// The vendor client's stale-data rule.
+
+const { staleDataCheck } = require('../../briskapi/decoder/engineio.cjs');
+
+// Server clock in nanoseconds for a JST wall time on 2021-09-27.
+const jstNs = (h, m = 0, s = 0) => BigInt(Date.UTC(2021, 8, 27, h - 9, m, s)) * 1_000_000n;
+const us = (h, m = 0, s = 0) => 1e6 * (3600 * h + 60 * m + s);
+
+test('stale data: the decoder clock may lag the server by 90 s during trading hours, not more', () => {
+  let clock = 0;
+  const stale = staleDataCheck({ date: '2021-09-27', now: () => clock });
+  assert.equal(stale.check(us(9, 58)), null, 'nothing is checked before the first heartbeat');
+  stale.beat(jstNs(10));
+  assert.equal(stale.check(us(9, 59)), null, '60 s behind is fine');
+  assert.equal(stale.check(us(9, 58, 30)), null, 'exactly 90 s is fine');
+  assert.match(stale.check(us(9, 58)).message, /data is stale: the decoder's clock is 120s behind the server \(limit 90s\)/);
+  assert.equal(stale.check(0), null, 'a decoder that has no time yet is not stale');
+  clock += 100_000;                      // the server clock keeps running between heartbeats
+  assert.match(stale.check(us(10)).message, /100s behind/);
+});
+
+test('stale data: outside trading hours, in the lunch break, or on another day, nothing is checked', () => {
+  const at = (h, m = 0) => { const s = staleDataCheck({ date: '2021-09-27', now: () => 0 }); s.beat(jstNs(h, m)); return s; };
+  for (const [h, m] of [[7, 59], [15, 0], [16, 30], [3, 0], [11, 30], [11, 59], [12, 9]]) {
+    assert.equal(at(h, m).check(us(1)), null, `${h}:${m}`);
+  }
+  for (const [h, m] of [[8, 0], [11, 29], [12, 10], [14, 59]]) {
+    assert.ok(at(h, m).check(us(1)), `${h}:${m} is checked`);
+  }
+  const other = staleDataCheck({ date: '2021-09-28', now: () => 0 });
+  other.beat(jstNs(10));
+  assert.equal(other.check(us(1)), null, 'the server is on a different day than the market date');
+});
+
+test('the heartbeat monitor reports a stale feed even while heartbeats keep coming', async () => {
+  let clock = 0;
+  const failures = [];
+  const monitor = heartbeatMonitor({ intervalMs: 7000, checkEveryMs: 5, now: () => clock, onFail: e => failures.push(e),
+    staleCheck: () => (clock > 100 ? new Error('SBI BRiSK data is stale: test') : null) });
+  monitor.beat(); await sleep(30);
+  assert.deepEqual(failures, []);
+  clock = 150; monitor.beat(); await sleep(30);
+  assert.match(failures[0].message, /data is stale/);
+  monitor.stop();
+});

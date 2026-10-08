@@ -52,10 +52,37 @@ function loadAssets(cache) {
   return assets;
 }
 
+// Position of the stock view's fields, relative to a version's base. Protocol 16000 (the 2021
+// demo, and the vendor client's own parse of it) puts a header word first. 18000 (SBI's current
+// build, as an independent parser of it reads the same view) drops that word, so every index is
+// one lower. The fields and their order are otherwise identical. Any other version is refused
+// rather than read at a guessed offset.
+const STOCK_VIEW_SHIFT = { 16000: 0, 18000: -1 };
+
+function stockViewShift(protocolVersion) {
+  if (!(protocolVersion in STOCK_VIEW_SHIFT)) {
+    throw new Error(`Stock view layout for protocol ${protocolVersion} is not known (known: ${Object.keys(STOCK_VIEW_SHIFT).join(', ')})`);
+  }
+  return STOCK_VIEW_SHIFT[protocolVersion];
+}
+
+// `words` is the raw _getStockView buffer; `ohlc` the number of OHLC bars ahead of the quote fields.
+function parseStockView(words, ohlc, shift) {
+  const a = words.subarray(6 * ohlc + shift);
+  return { frame: a[19], max_frame: a[20], source_time_us: u64(a, 17), last_price10: words[1 + shift],
+    open_price10: words[2 + shift], bid_price10: a[7], ask_price10: a[8], indicative_price10: a[9],
+    indicative_volume: u64(a, 10), indicative_side: a[12], closing_indicative_price10: a[13],
+    closing_indicative_volume: u64(a, 14), quote_flag: a[21], quote_side: a[22],
+    special_quote_time_us: u64(a, 23), indicative_open_price10: a[32], auction_reference_price10: a[35],
+    volume: u64(a, 3) };
+}
+
 class Decoder {
   // options.protocolVersion: 16000 for the Next demo (default), 18000 for SBI BRiSK.
-  // options.callbacks: { send(Buffer), heartbeat(ns BigInt), frameNumbers(Array), basePrice(n),
+  // options.callbacks: { send(Buffer), heartbeat(ns BigInt), frameNumbers(Array), basePrice(issueIndex),
   //   authError(), marketFinished() }, the vendor client's six WASM callbacks.
+  // options.boot: { exceptional_sq, base_prices } from the app boot response, applied in the
+  //   vendor client's order: after the master is loaded, before the snapshot.
   static async create(assets, options = {}) {
     // Isolate the legacy glue's globals and process exception handlers. No UI,
     // network, filesystem access or account state is needed inside this VM.
@@ -74,8 +101,10 @@ class Decoder {
     return new Decoder(wasm, assets, options);
   }
 
-  constructor(w, assets, { protocolVersion = manifest.protocol_version, callbacks = {} } = {}) {
+  constructor(w, assets, { protocolVersion = manifest.protocol_version, callbacks = {}, boot = {} } = {}) {
     this.w = w;
+    this.layoutShift = stockViewShift(protocolVersion);
+    this.basePriceQueue = new Set();
     this.authError = false;
     this.marketFinished = false;
     this.initialFrames = null;
@@ -96,7 +125,8 @@ class Decoder {
         this.lastHeartbeat = BigInt(low >>> 0) + (BigInt(high >>> 0) << 32n);
         callbacks.heartbeat?.(this.lastHeartbeat);
       }, 'viii'),
-      add((id, price) => callbacks.basePrice?.(price), 'vii'),
+      // basePrice(id, issueIndex): the decoder changed an issue's base price or limits.
+      add((id, issueIndex) => { this.basePriceQueue.add(issueIndex); callbacks.basePrice?.(issueIndex); }, 'vii'),
       add(() => { this.authError = true; callbacks.authError?.(); }, 'vii'),
       add(() => { this.marketFinished = true; callbacks.marketFinished?.(); }, 'vi'),
       protocolVersion);
@@ -114,8 +144,52 @@ class Decoder {
         name: Buffer.from(w.HEAPU8.subarray(this.buf + 144 * issue_id + 68,
           this.buf + 144 * issue_id + 68 + a[16])).toString('utf8') };
     });
+    this.boot = this.applyBoot(boot);
     this.unserialize(assets['snapshot.dat']);
     this.date = String(w._getDate(this.id));
+  }
+
+  // The vendor client pushes the boot response's exceptional special quotes and base-price
+  // changes into the decoder right after the master, then re-reads the master's limits.
+  applyBoot({ exceptional_sq = [], base_prices = [] } = {}) {
+    const byCode = new Map(this.master.map(m => [m.code, m.issue_id]));
+    const number = (value, what) => {
+      if (!Number.isFinite(value)) throw new Error(`Boot ${what} is not a number: ${JSON.stringify(value)}`);
+      return value;
+    };
+    for (const sq of exceptional_sq) {
+      if (!/^\d+$/.test(String(sq.issue_code))) {
+        throw new Error(`Boot exceptional_sq names issue code ${sq.issue_code}; only numeric codes are supported`);
+      }
+      this.w._pushSQ(this.id, Number(sq.issue_code), sq.buy_sell === 'B' ? 0 : 1, 10 * number(sq.jump_range, 'jump_range'),
+        number(sq.jump_sec, 'jump_sec'), 10 * number(sq.quote_limit_down, 'quote_limit_down'),
+        10 * number(sq.quote_limit_up, 'quote_limit_up'));
+    }
+    for (const change of base_prices) {
+      const issue = byCode.get(String(change.issue_code));
+      if (issue === undefined) throw new Error(`Boot base_prices names issue code ${change.issue_code}, which is not in the master`);
+      this.w._pushBasePrice(this.id, issue, number(change.base_price10, 'base_price10'),
+        number(change.limit_down10, 'limit_down10'), number(change.limit_up10, 'limit_up10'));
+      this.basePriceQueue.add(issue);
+    }
+    return { exceptional_sq: exceptional_sq.length, base_prices: base_prices.length, applied: this.applyBasePrice() };
+  }
+
+  // Re-read the master's price limits for issues whose base price changed (the vendor client
+  // does this after boot and after every frame); cheap when nothing is queued.
+  applyBasePrice() {
+    if (!this.basePriceQueue.size) return 0;
+    this.w._getStockMaster(this.id, this.buf, this.master.length * 144);
+    let applied = 0;
+    for (const issue of this.basePriceQueue) {
+      const m = this.master[issue];
+      if (!m) throw new Error(`Base price change for unknown issue index ${issue}`);
+      const a = new Uint32Array(this.w.HEAPU8.buffer, this.buf + 144 * issue, 36);
+      m.base_price10 = a[2]; m.limit_up10 = a[3]; m.limit_down10 = a[4];
+      applied++;
+    }
+    this.basePriceQueue.clear();
+    return applied;
   }
 
   push(data) {
@@ -214,15 +288,7 @@ class Decoder {
     if (!m) throw new Error(`Unknown issue ID: ${issue_id}`);
     if (!this.w._getStockView(this.id, issue_id, this.buf)) throw new Error(`Stock view unavailable: ${m.code}`);
     const words = new Uint32Array(this.w.HEAPU8.buffer, this.buf, this.viewWords);
-    const a = words.subarray(6 * this.ohlc);
-    const quote = { issue_id, code: m.code, frame: a[19], max_frame: a[20],
-      source_time_us: u64(a, 17), last_price10: words[1], open_price10: words[2],
-      bid_price10: a[7], ask_price10: a[8], indicative_price10: a[9],
-      indicative_volume: u64(a, 10), indicative_side: a[12],
-      closing_indicative_price10: a[13], closing_indicative_volume: u64(a, 14),
-      quote_flag: a[21], quote_side: a[22], special_quote_time_us: u64(a, 23),
-      indicative_open_price10: a[32], auction_reference_price10: a[35],
-      volume: u64(a, 3) };
+    const quote = { issue_id, code: m.code, ...parseStockView(words, this.ohlc, this.layoutShift) };
     // SBI's build has no portfolio export, so its quotes carry no issue_status.
     if (this.w._getPortfolio) {
       if (!this.w._getPortfolio(this.id, Number(m.code), this.buf)) throw new Error(`Portfolio unavailable: ${m.code}`);
@@ -315,7 +381,7 @@ async function main(argv) {
     } });
 }
 
-module.exports = { Decoder, QuoteHistory, frames, u64, loadAssets, replay, main };
+module.exports = { Decoder, QuoteHistory, frames, u64, loadAssets, replay, main, parseStockView, stockViewShift, STOCK_VIEW_SHIFT };
 if (require.main === module) main(process.argv.slice(2)).catch(error => {
   console.error(error.message); process.exitCode = 1;
 });

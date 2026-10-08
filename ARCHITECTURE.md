@@ -120,24 +120,47 @@ bundle) and in pybrisk's SBI research (`engineio.cjs` and `sbi.cjs`):
    pushed into the WASM before quote tracing starts. Frames that arrive meanwhile
    are not lost.
 4. The server heartbeat, decoded by the WASM, is watched: no beat for 7 s after the
-   first one is a connection failure, as in the vendor client. The WASM's
-   `authError` is the single-session rule (one WebSocket per user), and
-   `marketFinished` makes an abnormal close a normal end.
+   first one is a connection failure, as in the vendor client. A second rule is the
+   vendor's too: during trading hours (08:00-15:00 JST, not 11:30-12:10) the
+   decoder's data time may lag the server clock, taken from the heartbeat, by at
+   most 90 s. The WASM's `authError` is the single-session rule (one WebSocket per
+   user), and `marketFinished` makes an abnormal close a normal end.
+5. The decoder protocol comes from the boot response's `flex_version` (an explicit
+   option wins; 18000 if the server says nothing). The boot response's
+   `exceptional_sq` and `base_prices` are pushed into the WASM after the master is
+   loaded and before the snapshot, as the vendor client does, and the master's
+   limits are re-read after every frame in case the decoder changes them.
+
+The ping loop is the WASM's own. In the real decoder, market and sync frames never
+trigger a ping; each heartbeat frame (`0xF0` and an 8-byte little-endian clock)
+triggers one reply ping carrying the server clock as the decoder estimates it. The
+loop therefore sustains itself once the server starts it, and the host only has to
+forward the bytes.
+
+The stock view and the master are read at version-specific positions. Protocol
+16000 (the demo) is the vendor client's own layout. For 18000 (SBI) the stock
+view has the same fields in the same order with the leading word dropped, so every
+index is one lower; this comes from a single independent parser of SBI's current
+build and is not confirmed against SBI itself. The master's 18000 layout has no
+independent source at all, so a master that does not look like a market (numeric
+codes, base prices inside their limits, plausible lot sizes) is refused. Any other
+protocol version is refused rather than read at guessed offsets.
 
 What is verified: the decoder SBI served in pybrisk's March 2026 capture exports
 the demo's interface apart from `_getPortfolio` (so SBI quotes have no
-`issue_status`), and it initializes under Node with protocol 18000. The callbacks
-are tested through the WASM's own function table, and the whole flow offline
-against fake servers (plain, Engine.IO 3 and 4) using the demo decoder. What is not
-verified against a live session: any of the above on SBI itself, and three wire
-details that are not public: the Socket.IO connect parameters, the `startLive`
-payload and the catch-up request body. They live in a profile
+`issue_status`), and it initializes under Node with protocol 18000. The demo
+decoder is tested against the vendor client's own indices on real data, and its
+heartbeat, ping reply and callbacks through its function table; the ping loop and
+the whole flow run offline against fake servers (plain, Engine.IO 3 and 4) using it.
+What is not verified against a live session: any of the above on SBI itself, the
+18000 master layout, and three wire details that are not public: the Socket.IO
+connect parameters, the `startLive` payload and the catch-up request body. They live in a profile
 (`BRISK_SBI_PROFILE`, or `sbi.connect(profile=...)`); the defaults are labelled
 unverified, and the catch-up request is used only when the profile names a format.
 `--trace-protocol` prints the connection with every token redacted, so a first
 attempt shows what the server answers. Anything wrong ends in an explicit error (a
 stream that never initializes, a refused namespace, a rejected catch-up, an
-implausible stock view) rather than guessed data. Not implemented: reconnecting.
+implausible stock view or master) rather than guessed data. Not implemented: reconnecting.
 The feed fails and needs a restart.
 
 ## Reconstructing a recording
