@@ -13,4 +13,4 @@ calls replace pybrisk's interface. No vendor bundles or raw captures from
 that repository are bundled here. SBI BRiSK's decoder is downloaded at runtime
 with the user's own session and is never stored or redistributed by this project.
 Dependencies retain their own licenses. Cargo.lock records Rust dependencies;
-boto3 uses Apache-2.0. NautilusTrader is an optional separately installed runtime.
+boto3 uses Apache-2.0.

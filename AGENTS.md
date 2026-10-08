@@ -7,8 +7,7 @@ bucket, region and API URL. SBI market data must never reach the archive; SBI
 sessions contribute timing reports only.
 
 Run focused archive and API coverage (minimum 85%), the fixture reference test,
-Node tests, Rust tests/fmt/Clippy and, when changing the bus integration, the
-actual v2 tests. CI supplies downloaded demo fixtures. Keep README.md (usage only),
+Node tests and Rust tests/fmt/Clippy. CI supplies downloaded demo fixtures. Keep README.md (usage only),
 its Japanese translation README.ja.md, ARCHITECTURE.md (internals), PRIVACY.md and
 schema documentation synchronized; changes to collected data bump `POLICY_VERSION`.
 

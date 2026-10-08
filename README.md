@@ -180,7 +180,6 @@ API never asks: until you decide, sessions stay on your computer.
 - [PRIVACY.md](https://github.com/honvl/BRiSKapi/blob/main/PRIVACY.md): privacy policy
 - [CONTRIBUTING.md](https://github.com/honvl/BRiSKapi/blob/main/CONTRIBUTING.md): development, tests and releases
 - [tools/brisk_mock/README.md](https://github.com/honvl/BRiSKapi/blob/main/tools/brisk_mock/README.md): Rust collector, field definitions, timing and latency
-- [tools/brisk_mock/NAUTILUS_V2.md](https://github.com/honvl/BRiSKapi/blob/main/tools/brisk_mock/NAUTILUS_V2.md): NautilusTrader v2 integration
 - [infra/README.md](https://github.com/honvl/BRiSKapi/blob/main/infra/README.md): deploying your own archive
 - [THIRD_PARTY.md](https://github.com/honvl/BRiSKapi/blob/main/THIRD_PARTY.md): decoder, data and pybrisk attribution
 

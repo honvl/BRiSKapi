@@ -5,7 +5,7 @@ with a Rust latest-state collector and the demo's actual WASM book decoder hoste
 in Node. No browser or Tachibana account is needed to run it. Assets are downloaded
 separately, pinned by SHA-256 and never committed to this repository.
 
-From the repository root, using Python from `.venv` or `.venv-nautilus-dev`:
+From the repository root, using Python from `.venv`:
 
 ```sh
 .venv/bin/python tools/brisk_mock/download_mock.py --cache /tmp/brisk-mock-cache
@@ -123,12 +123,11 @@ publishing. Restart loads a fresh snapshot; there is no automatic live reconnect
 
 ## Latency indication
 
-For strategies, the [Nautilus v2 bus integration](NAUTILUS_V2.md) now hosts the
-Rust state in-process and publishes validated auction events immediately through
-a v2 data actor. This path has no latest-file polling or 20 ms snapshot timer.
-It includes per-security/all-market subscriptions, retained-state requests and
-stream validity notifications. The standalone CLI described here remains useful
-for recording and latest-state files.
+For strategies, consume the decoder's JSON batches directly (or `briskapi.Feed`)
+rather than polling the latest-state file, which is published on a 20 ms timer.
+The NautilusTrader v2 actor that used to live in this repository, with its
+in-process Rust state, is maintained outside it. The standalone CLI described here
+remains useful for recording and latest-state files.
 
 The terminal prints local latency indicators once per second; `--status-ms 0`
 disables this display. The latest-state JSON contains a `latency` object with

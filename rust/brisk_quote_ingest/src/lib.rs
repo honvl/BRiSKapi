@@ -5,8 +5,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 pub mod latency;
 use latency::Latency;
-#[cfg(feature = "python")]
-mod python;
 
 #[derive(Debug, Deserialize)]
 pub struct Batch {

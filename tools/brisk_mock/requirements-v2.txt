@@ -1,4 +1,0 @@
-# Install with --extra-index-url https://packages.nautechsystems.io/simple
-# This published wheel is tested independently of the user's custom v2 build.
-nautilus_trader==2.0.0rc6.dev20261004
-pytest==9.1.1

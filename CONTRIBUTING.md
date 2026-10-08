@@ -38,10 +38,8 @@ cargo clippy --locked --manifest-path rust/brisk_quote_ingest/Cargo.toml --all-t
 ```
 
 Ordinary tests are local and never touch the cloud. `BRISK_MOCK_CACHE` opts into
-fixture replay. Optional v2 tests need the separately installed pinned runtime
-and native extension, as described in `tools/brisk_mock/NAUTILUS_V2.md`. CI runs
-all of the above plus the actual Nautilus v2 bus. Aim for at least 85% coverage
-of new behavior.
+fixture replay. CI runs all of the above. Aim for at least 85% coverage of new
+behavior.
 
 Keep `README.md` and `README.ja.md` in step; internals belong in `ARCHITECTURE.md`.
 Everything the installed package needs at runtime lives in `briskapi/` (package

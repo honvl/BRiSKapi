@@ -11,7 +11,7 @@ itself. For usage, see the [README](README.md).
 | Python API | `briskapi/` | `Recording` (files), `Feed` (live, background thread), `Ticker`/`Market` views and `Archive`. |
 | SBI session | `briskapi/sbi.py` | Cookie login, token boot and SBI's REST data behind `Ticker.candles`/`margin` and `Market.turnover`/`lists`/`events`/`schedule`/`watchlist`; `sbi.connect()` starts the live host. |
 | Archive client | `briskapi/cli.py`, `briskapi/schema.py` | The `brisk` CLI, sharing consent, canonical packaging, upload and verified download. |
-| Auction state | `rust/brisk_quote_ingest` | Optional Rust tools: `brisk_quote_ingest` validates batches, keeps per-security state and publishes latest-state files; `brisk_recording` reconstructs a saved recording; an optional PyO3 module serves Nautilus v2. |
+| Auction state | `rust/brisk_quote_ingest` | Optional Rust tools: `brisk_quote_ingest` validates batches, keeps per-security state and publishes latest-state files; `brisk_recording` reconstructs a saved recording. |
 | Archive service | `archive_service.py`, `infra/deploy.py` | A Lambda function URL issues upload tickets; S3-triggered ingest validates and publishes; DynamoDB holds quotas. |
 
 ```

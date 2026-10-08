@@ -185,7 +185,6 @@ Python API から確認を求めることはありません。決めるまでは
 - [PRIVACY.md](PRIVACY.md): プライバシーポリシー
 - [CONTRIBUTING.md](CONTRIBUTING.md): 開発、テスト、リリース
 - [tools/brisk_mock/README.md](tools/brisk_mock/README.md): Rust コレクター、フィールド定義、タイミングとレイテンシー
-- [tools/brisk_mock/NAUTILUS_V2.md](tools/brisk_mock/NAUTILUS_V2.md): NautilusTrader v2 との連携
 - [infra/README.md](infra/README.md): 独自アーカイブのデプロイ
 - [THIRD_PARTY.md](THIRD_PARTY.md): デコーダー、データ、pybrisk の権利表示
 
