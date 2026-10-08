@@ -252,7 +252,7 @@ def live(args):
         warnings.simplefilter('always')
         if args.sbi:  # Market data stays local; only a timing summary is contributed.
             sbi.login()
-            feed = sbi.connect(codes=codes)
+            feed = sbi.connect(codes=codes, trace_protocol=args.trace_protocol)
         else:
             feed = connect(web=args.web, cache=args.cache, codes=codes, speed=args.speed, limit_frames=args.limit_frames)
     for warning in caught:
@@ -308,6 +308,8 @@ def _main(argv):
     p.add_argument('--raw', action='store_true', help='Vendor fields (price10, microseconds) instead of yen/ISO times')
     group.add_argument('--sbi', action='store_true',
                        help='Live SBI BRiSK (experimental); cookies from BRISK_SBI_COOKIES or saved with sbi.login(remember=True)')
+    p.add_argument('--trace-protocol', action='store_true',
+                   help='With --sbi: print the connection steps to stderr, every token redacted (wire details in BRISK_SBI_PROFILE)')
     p = sub.add_parser('upload', help='Contribute a prepared package'); p.add_argument('directory', type=Path)
     p = sub.add_parser('list', help='List published recordings'); p.add_argument('--date'); p.add_argument('--source', choices=['historical_mock','synthetic_test'])
     p = sub.add_parser('pull', help='Download and verify a recording'); p.add_argument('prefix'); p.add_argument('--output', type=Path, required=True)

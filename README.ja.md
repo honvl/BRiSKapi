@@ -103,11 +103,17 @@ toyota.quote()                              # 他のフィードと同じ呼び�
 リクエストは1秒に1回までに制限しています。
 
 ライブフィードは、ご自身のセッションでダウンロードした SBI 自身のデコーダーを
-Node 上で動かします。ブラウザは使いません。まだ実際の SBI セッションでは
-検証できていないため、推測で動かさず、問題があれば明示的なエラーで止まり
-ます。結果をぜひお知らせください。Cookie は sbi.brisk.jp にのみ送られ、SBI の
-市場データがお使いのコンピューターから出ることはありません。共有をオンにすると、
-セッションはタイミングの要約だけを共有します（下記参照）。
+Node 上で動かします。ブラウザは使いません。ベンダーのクライアントと同じ接続手順
+（最初のフレームからデコーダーに入力し、スナップショットをストリームに追いつかせ、
+デコーダー自身の ping を送り、サーバーのハートビートを監視し、サーバーが Socket.IO
+を使う場合はその名前空間に参加）に従います。まだ実際の SBI セッションでは検証
+できておらず、公開されていない通信の詳細が3つあります（Socket.IO の接続パラメー
+ター、`startLive` のペイロード、追いつき要求の本文）。`sbi.connect(profile={...})`
+で設定し、`trace_protocol=True`（トークンはすべて伏せ字）でサーバーの応答を確認
+してください。正しくなるまでは、推測で動かさず、明示的なエラーで止まります。
+結果をぜひお知らせください。Cookie は sbi.brisk.jp にのみ送られ、SBI の市場データが
+お使いのコンピューターから出ることはありません。共有をオンにすると、セッションは
+タイミングの要約だけを共有します（下記参照）。
 
 ## API リファレンス
 
@@ -142,7 +148,7 @@ Node 上で動かします。ブラウザは使いません。まだ実際の SB
 
 ```sh
 brisk live --web --codes 7203,6758          # 気配の更新ごとに JSON を1行出力（--raw でベンダー形式）
-brisk live --sbi --codes 7203               # SBI BRiSK。Cookie は BRISK_SBI_COOKIES（JSON）から
+brisk live --sbi --codes 7203               # SBI BRiSK。Cookie は BRISK_SBI_COOKIES（JSON）から。--trace-protocol で接続手順を表示（通信の詳細は BRISK_SBI_PROFILE）
 brisk record --web --output recordings/s1   # デモを記録（同意済みなら共有）
 brisk list --date 20210927 --source historical_mock
 brisk pull archive/20210927/SHA256 --output recordings/downloaded

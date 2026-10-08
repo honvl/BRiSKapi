@@ -203,6 +203,23 @@ def test_live_feed_via_node(fake_host, capfd):
     assert capfd.readouterr().err.strip() == '["--codes","7203"]'
 
 
+def test_protocol_options_reach_the_host_without_putting_the_profile_in_argv(tmp_path, monkeypatch, capfd):
+    script = tmp_path / 'sbi_options.cjs'
+    script.write_text(
+        "console.error(JSON.stringify({argv: process.argv.slice(2), profile: process.env.BRISK_SBI_PROFILE || null}));\n"
+        f"for (const b of {json.dumps(sbi_session())}) console.log(JSON.stringify(b));\n")
+    monkeypatch.setattr(sbi, 'DECODER', script)
+    sbi.login({'session_bfaf77a2': 'v'})
+    profile = {'connectQuery': {'_v': 'build-9'}, 'catchUp': 'json-vendor'}
+    sbi.connect(codes=['7203'], trace_protocol=True, profile=profile).wait()
+    seen = json.loads(capfd.readouterr().err.strip())
+    assert seen['argv'] == ['--codes', '7203', '--trace-protocol']
+    assert json.loads(seen['profile']) == profile
+    assert 'build-9' not in ' '.join(seen['argv'])
+    sbi.connect(codes=['7203']).wait()
+    assert json.loads(capfd.readouterr().err.strip()) == {'argv': ['--codes', '7203'], 'profile': None}
+
+
 def test_live_feed_failure_closes(fake_host, tmp_path, monkeypatch):
     sbi.login({'session_bfaf77a2': 'wrong'})
     with pytest.raises(briskapi.BriskError, match='before bootstrap'):
@@ -222,6 +239,12 @@ def test_cli_live_sbi(fake_host, monkeypatch, capsys):
     assert lines[-1]['last_price'] == 10160.0 and 'timing summary' in out.err
     assert cli.load_consent()['enabled'] and sent[0]['source'] == 'sbi_live'
     assert not {'quotes', 'master', 'code', 'price'} & set(json.dumps(sent[0]).replace('"', ' ').split())
+
+
+def test_cli_trace_protocol_reaches_the_sbi_host(fake_host, monkeypatch, capfd):
+    monkeypatch.setenv('BRISK_SBI_COOKIES', '{"session_bfaf77a2": "v"}')
+    cli.main(['live', '--sbi', '--codes', '7203', '--trace-protocol'])
+    assert capfd.readouterr().err.count('["--codes","7203","--trace-protocol"]') == 1
 
 
 def test_sbi_feed_contributes_timing_only(fake_host, monkeypatch):

@@ -99,11 +99,17 @@ again), `briskapi.NotFoundError`, `sbi.RateLimitError` and `sbi.APIError`.
 Requests are limited to one per second.
 
 The live feed runs SBI's own decoder under Node, downloaded with your session;
-no browser is involved. It hasn't yet been validated against a live SBI session,
-so it fails with an explicit error rather than guessing. Please report what you
-see. Your cookies go only to sbi.brisk.jp, and SBI market data never leaves
-your computer. With sharing on, a session contributes only a timing summary (see
-below).
+no browser is involved. It follows the vendor client's connect sequence: it feeds
+the decoder from the first frame, catches the snapshot up to the stream, forwards
+the decoder's pings, watches the server heartbeat and joins SBI's Socket.IO
+namespace when the server uses it. It hasn't yet been validated against a live SBI
+session, and three wire details aren't public: the Socket.IO connect parameters,
+the `startLive` payload and the catch-up request body. Set them with
+`sbi.connect(profile={...})` and see what the server answers with
+`trace_protocol=True` (every token redacted); until they are right it stops with an
+explicit error rather than guessing. Please report what you see. Your cookies go
+only to sbi.brisk.jp, and SBI market data never leaves your computer. With sharing
+on, a session contributes only a timing summary (see below).
 
 ## API reference
 
@@ -138,7 +144,7 @@ recording once (about six seconds for the complete 420 MB demo).
 
 ```sh
 brisk live --web --codes 7203,6758          # one JSON object per quote update (--raw for vendor fields)
-brisk live --sbi --codes 7203               # SBI BRiSK; cookies from BRISK_SBI_COOKIES (JSON)
+brisk live --sbi --codes 7203               # SBI BRiSK; cookies from BRISK_SBI_COOKIES (JSON); --trace-protocol shows the handshake, wire details in BRISK_SBI_PROFILE
 brisk record --web --output recordings/s1   # record a replay (shared if you agreed)
 brisk list --date 20210927 --source historical_mock
 brisk pull archive/20210927/SHA256 --output recordings/downloaded

@@ -241,11 +241,21 @@ def _default() -> Client:
     return _client
 
 
-def connect(codes=None, history=False, node='node', timeout=120, contribute=None):
+def connect(codes=None, history=False, node='node', timeout=120, contribute=None, trace_protocol=False, profile=None):
     """Experimental live SBI BRiSK feed: SBI's own WASM decoder under Node, never Chrome.
 
     Returns a briskapi.Feed (the default source for briskapi.Ticker and Market).
-    The SBI live protocol has not been validated end to end; failures are explicit.
+    The host follows the vendor client's connect sequence: it feeds the WASM from the
+    first frame, catches the snapshot up to the stream, forwards the WASM's pings and
+    watches the server heartbeat. It also joins SBI's Socket.IO namespace when the
+    server speaks it. Three wire details are not public, so they can be set with
+    `profile` (a dict, sent through the environment because it may name tokens):
+
+        profile={"connectQuery": {"_v": "..."}, "startLive": {...}, "catchUp": "json-vendor"}
+
+    `trace_protocol=True` prints the connection steps to stderr with every token
+    redacted, to see what the server answers. The protocol has not been validated end to
+    end against a live session; failures are explicit.
     Market data never leaves your computer. With sharing on (briskapi.consent), a
     timing-only summary is contributed when the session ends; contribute=False
     keeps even that local.
@@ -256,8 +266,12 @@ def connect(codes=None, history=False, node='node', timeout=120, contribute=None
     command = [node, str(DECODER)]
     if codes:
         command += ['--codes', codes if isinstance(codes, str) else ','.join(map(str, codes))]
-    # Cookies travel in the environment, never on the command line (visible to other users).
+    if trace_protocol:
+        command.append('--trace-protocol')
+    # Cookies and the profile travel in the environment, never on the command line (visible to other users).
     env = {**os.environ, 'BRISK_SBI_COOKIES': json.dumps(session.cookies)}
+    if profile:
+        env['BRISK_SBI_PROFILE'] = json.dumps(profile)
     feed = Feed(command=command, env=env, history=history, contribute=contribute, timing='sbi_live')
     try:
         return load(feed.ready(timeout))

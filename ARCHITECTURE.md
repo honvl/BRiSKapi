@@ -101,15 +101,44 @@ pinned), checks that it exports every function the host calls, and decodes
 WebSocket frames with protocol version 18000. Cookies reach it through the
 environment, never the command line.
 
+The host follows the connect sequence in the vendor client (the public Next demo
+bundle) and in pybrisk's SBI research (`engineio.cjs` and `sbi.cjs`):
+
+1. The WASM is started with its six callbacks (`send`, `updateNumber`,
+   `heartbeat`, `basePrice`, `authError`, `marketFinished`) using the vendor's
+   signatures. `send` bytes, which are the WASM's own pings, are written to the
+   socket as raw binary frames; the vendor client has no ping timer of its own.
+2. The link detects the server's dialect from its first message. A plain server
+   (Next) sends binary frames. SBI's, per pybrisk's capture, opens with an Engine.IO
+   packet; the host then joins the `/v2/user` namespace with a query, sends a
+   `startLive` event and answers Engine.IO keepalives (clients ping on version 3,
+   servers on version 4).
+3. Frames go to the WASM immediately. When the first frame numbers arrive, the
+   host compares them with the snapshot's. Issues whose snapshot is behind are
+   caught up with `POST /api/stocks_update/{series}` (up to five retries, never for
+   an expired session or an `x-error-reason: too-old` reply) and the reply is
+   pushed into the WASM before quote tracing starts. Frames that arrive meanwhile
+   are not lost.
+4. The server heartbeat, decoded by the WASM, is watched: no beat for 7 s after the
+   first one is a connection failure, as in the vendor client. The WASM's
+   `authError` is the single-session rule (one WebSocket per user), and
+   `marketFinished` makes an abnormal close a normal end.
+
 What is verified: the decoder SBI served in pybrisk's March 2026 capture exports
 the demo's interface apart from `_getPortfolio` (so SBI quotes have no
-`issue_status`), and it initializes under Node with protocol 18000. The host's
-whole flow is tested offline against a fake server using the demo decoder. What
-is not yet verified against a live session: the WebSocket handshake, keepalives,
-whether the snapshot needs catch-up (`/api/stocks_update`) before the stream
-starts, and the stock-view layout of SBI's build. Each of these fails with an
-explicit error (for example, a stream that never initializes, or quotes whose
-frame or time are implausible) rather than producing guessed data.
+`issue_status`), and it initializes under Node with protocol 18000. The callbacks
+are tested through the WASM's own function table, and the whole flow offline
+against fake servers (plain, Engine.IO 3 and 4) using the demo decoder. What is not
+verified against a live session: any of the above on SBI itself, and three wire
+details that are not public: the Socket.IO connect parameters, the `startLive`
+payload and the catch-up request body. They live in a profile
+(`BRISK_SBI_PROFILE`, or `sbi.connect(profile=...)`); the defaults are labelled
+unverified, and the catch-up request is used only when the profile names a format.
+`--trace-protocol` prints the connection with every token redacted, so a first
+attempt shows what the server answers. Anything wrong ends in an explicit error (a
+stream that never initializes, a refused namespace, a rejected catch-up, an
+implausible stock view) rather than guessed data. Not implemented: reconnecting.
+The feed fails and needs a restart.
 
 ## Reconstructing a recording
 

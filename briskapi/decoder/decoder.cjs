@@ -54,6 +54,8 @@ function loadAssets(cache) {
 
 class Decoder {
   // options.protocolVersion: 16000 for the Next demo (default), 18000 for SBI BRiSK.
+  // options.callbacks: { send(Buffer), heartbeat(ns BigInt), frameNumbers(Array), basePrice(n),
+  //   authError(), marketFinished() }, the vendor client's six WASM callbacks.
   static async create(assets, options = {}) {
     // Isolate the legacy glue's globals and process exception handlers. No UI,
     // network, filesystem access or account state is needed inside this VM.
@@ -72,14 +74,32 @@ class Decoder {
     return new Decoder(wasm, assets, options);
   }
 
-  constructor(w, assets, { protocolVersion = manifest.protocol_version } = {}) {
+  constructor(w, assets, { protocolVersion = manifest.protocol_version, callbacks = {} } = {}) {
     this.w = w;
     this.authError = false;
+    this.marketFinished = false;
     this.initialFrames = null;
-    const add = (fn, sig = 'viii') => w.addFunction(fn, sig);
-    this.id = w._initialize(add(() => {}), add((id, p, count) => {
-      this.initialFrames = Array.from(new Uint32Array(w.HEAPU8.buffer, p, count));
-    }), add(() => {}), add(() => {}), add(() => { this.authError = true; }), add(() => {}), protocolVersion);
+    this.lastHeartbeat = null;
+    // The signatures are the vendor client's own (an indirect call with another type traps).
+    const add = (fn, sig) => w.addFunction(fn, sig);
+    this.id = w._initialize(
+      // send(id, ptr, len): bytes the client must write to the server. The WASM decides
+      // when (the vendor client has no ping timer of its own), so a host must forward them.
+      add((id, ptr, len) => callbacks.send?.(Buffer.from(w.HEAPU8.slice(ptr, ptr + len))), 'viii'),
+      // updateNumber(id, ptr, count): the first frame number of every issue on the stream.
+      add((id, p, count) => {
+        this.initialFrames = Array.from(new Uint32Array(w.HEAPU8.buffer, p, count));
+        callbacks.frameNumbers?.(this.initialFrames);
+      }, 'viii'),
+      // heartbeat(id, low, high): the server's clock, nanoseconds since the Unix epoch.
+      add((id, low, high) => {
+        this.lastHeartbeat = BigInt(low >>> 0) + (BigInt(high >>> 0) << 32n);
+        callbacks.heartbeat?.(this.lastHeartbeat);
+      }, 'viii'),
+      add((id, price) => callbacks.basePrice?.(price), 'vii'),
+      add(() => { this.authError = true; callbacks.authError?.(); }, 'vii'),
+      add(() => { this.marketFinished = true; callbacks.marketFinished?.(); }, 'vi'),
+      protocolVersion);
     this.buf = w._malloc(BUFFER);
     this.aux = w._malloc(64);
     this.push(assets['master.dat']);
@@ -152,13 +172,32 @@ class Decoder {
   start(frame) {
     this.feed(frame);
     if (!this.initialFrames) return false;
-    if (this.initialFrames.length !== this.master.length) throw new Error('Missing frame-number bootstrap');
+    if (this.laggingIssues().length) throw new Error('Snapshot needs unavailable catch-up data');
+    this.begin();
+    return true;
+  }
+
+  // Frame number of every issue as the decoder holds it now (the snapshot's, before catch-up).
+  frameNumbers() {
     this.w._getFrameNumbers(this.id, this.buf, this.master.length);
-    const current = new Uint32Array(this.w.HEAPU8.buffer, this.buf, this.master.length);
-    if (this.initialFrames.some((n, i) => current[i] < n)) throw new Error('Snapshot needs unavailable catch-up data');
+    return Array.from(new Uint32Array(this.w.HEAPU8.buffer, this.buf, this.master.length));
+  }
+
+  // Issues whose snapshot is older than the stream's first frame: the ranges a live
+  // client must fetch before the state is consistent. Empty for the demo's cut recording.
+  laggingIssues() {
+    if (!this.initialFrames) throw new Error('Frame numbers not received yet');
+    if (this.initialFrames.length !== this.master.length) throw new Error('Missing frame-number bootstrap');
+    const current = this.frameNumbers();
+    const lagging = [];
+    this.initialFrames.forEach((to, issue_id) => { if (current[issue_id] < to) lagging.push({ issue_id, from: current[issue_id], to }); });
+    return lagging;
+  }
+
+  // Mark the API data complete and start tracing quote changes.
+  begin() {
     this.w._apiRecieved(this.id);
     this.trace = this.w._addTraceUpdate(this.id);
-    return true;
   }
 
   changed() {
