@@ -60,6 +60,12 @@ live architecture reference; it is not a verified Tachibana BRiSK Next connector
 The reader also polls every 500 ms and extracts QR events, which does not provide
 the complete auction state this collector needs.
 
+briskapi's own SBI live feed (`briskapi.sbi.connect`, `brisk live --sbi`) does not
+use a browser or CDP. `briskapi/decoder/sbi.cjs` logs in with your session cookies,
+downloads SBI's decoder, master and snapshot, opens the WebSocket itself and runs
+the same Node `Decoder` as this demo host (protocol version 18000 for SBI). It is
+experimental and has not been validated against a live SBI session.
+
 A live Next adapter still needs an authenticated Next session to establish its
 actual bootstrap, master/snapshot, WebSocket handshake, keepalives and catch-up
 behavior. The upstream native wire decoder remains experimental. Downloading

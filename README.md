@@ -1,6 +1,6 @@
 # briskapi
 
-[English](README.md) | [日本語](README.ja.md)
+[English](https://github.com/honvl/BRiSKapi/blob/main/README.md) | [日本語](https://github.com/honvl/BRiSKapi/blob/main/README.ja.md)
 
 An unofficial, pybrisk-style Python API and `brisk` command line for BRiSK auction
 data. Consume a live feed, query recordings at any point in time, pull shared
@@ -165,7 +165,7 @@ API never asks: until you decide, sessions stay on your computer.
   alias (random `anon-…` by default) and license. Your IP address is used only to
   rate limit uploads.
 - **Visibility:** published recordings are public and permanent, and you cannot
-  delete them yourself. See [PRIVACY.md](PRIVACY.md).
+  delete them yourself. See [PRIVACY.md](https://github.com/honvl/BRiSKapi/blob/main/PRIVACY.md).
 - **Opting out:** `brisk consent --revoke`, `BRISK_CONTRIBUTE=0`, or `--no-upload`
   for one run.
 - **License:** accepting declares that you may redistribute the recordings under
@@ -176,12 +176,12 @@ API never asks: until you decide, sessions stay on your computer.
 
 ## More documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): how it works, data format, archive integrity and limits
-- [PRIVACY.md](PRIVACY.md): privacy policy
-- [CONTRIBUTING.md](CONTRIBUTING.md): development, tests and releases
-- [tools/brisk_mock/README.md](tools/brisk_mock/README.md): Rust collector, field definitions, timing and latency
-- [tools/brisk_mock/NAUTILUS_V2.md](tools/brisk_mock/NAUTILUS_V2.md): NautilusTrader v2 integration
-- [infra/README.md](infra/README.md): deploying your own archive
-- [THIRD_PARTY.md](THIRD_PARTY.md): decoder, data and pybrisk attribution
+- [ARCHITECTURE.md](https://github.com/honvl/BRiSKapi/blob/main/ARCHITECTURE.md): how it works, data format, archive integrity and limits
+- [PRIVACY.md](https://github.com/honvl/BRiSKapi/blob/main/PRIVACY.md): privacy policy
+- [CONTRIBUTING.md](https://github.com/honvl/BRiSKapi/blob/main/CONTRIBUTING.md): development, tests and releases
+- [tools/brisk_mock/README.md](https://github.com/honvl/BRiSKapi/blob/main/tools/brisk_mock/README.md): Rust collector, field definitions, timing and latency
+- [tools/brisk_mock/NAUTILUS_V2.md](https://github.com/honvl/BRiSKapi/blob/main/tools/brisk_mock/NAUTILUS_V2.md): NautilusTrader v2 integration
+- [infra/README.md](https://github.com/honvl/BRiSKapi/blob/main/infra/README.md): deploying your own archive
+- [THIRD_PARTY.md](https://github.com/honvl/BRiSKapi/blob/main/THIRD_PARTY.md): decoder, data and pybrisk attribution
 
 Software is MIT licensed.

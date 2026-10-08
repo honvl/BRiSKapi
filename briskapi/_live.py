@@ -45,6 +45,7 @@ def _stop(process):
 
 def stream(web=False, cache=None, codes=None, speed=1, limit_frames=None, node='node') -> Iterator[dict]:
     """Yield raw decoded batches as each frame replays (bootstrap, quote deltas, end)."""
+    cli.check_node(node)
     process = _decoder(web, cache, codes, speed, limit_frames, node)
     try:
         for line in process.stdout:
@@ -90,6 +91,7 @@ class Feed:
                  history=False, node='node', *, command=None, env=None, timing=None):
         # `command` runs another decoder host (SBI live). Its market data is never
         # contributed; with `timing` set, a timing-only summary may be.
+        cli.check_node(command[0] if command else node)
         if command is None:
             choice, upload = _consent(contribute, limit_frames)
             self._choice, self._timing = (choice if upload else None), None

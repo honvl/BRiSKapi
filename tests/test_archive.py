@@ -448,6 +448,7 @@ def harness(tmp_path, monkeypatch):
         else:
             Path(cmd[cmd.index('--events') + 1]).write_bytes(raw(batches()))
     monkeypatch.setattr(cli.subprocess, 'run', run)
+    monkeypatch.setattr(cli, 'check_node', lambda node='node': None)
     (tmp_path / 'source.jsonl').write_bytes(raw(batches()))
     def main(*args):
         cli.main(['--config', str(config), *args])
@@ -529,6 +530,7 @@ def test_consent_controls(tmp_path, monkeypatch, harness, capsys):
 def test_record_events_command(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(cli.subprocess, 'run', lambda cmd, check, stdout=None: calls.append((cmd, stdout)))
+    monkeypatch.setattr(cli, 'check_node', lambda node='node': None)
     cli.record_events(tmp_path / 'e.jsonl', cache=tmp_path, codes=['7203', '6758'], limit_frames=5, speed=0)
     cmd, stdout = calls[0]
     assert cmd[:2] == ['node', str(cli.DECODER)] and stdout is not None and cli.DECODER.exists()

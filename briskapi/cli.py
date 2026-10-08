@@ -20,12 +20,14 @@ import warnings
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
+from briskapi._recording import BriskError
 from briskapi.schema import (SCHEMA, MAX_TIMING_BYTES, canonical_lines, compress, digest, inspect_package, validate_manifest,
                              validate_stream, validate_timing, require)
 
 PACKAGE = Path(__file__).resolve().parent
 # BRiSK's own WASM decoder runs under Node; the package ships only this host and SHA-256 pins.
 DECODER = PACKAGE / 'decoder' / 'decoder.cjs'
+MIN_NODE = 22
 LICENSES = ('CC0-1.0', 'CC-BY-4.0')
 # Bump with any PRIVACY.md change to what is collected; saved choices then lapse.
 POLICY_VERSION = 2
@@ -45,6 +47,20 @@ Accepting declares that you may redistribute these recordings under that license
 Policy: https://github.com/honvl/BRiSKapi/blob/main/PRIVACY.md
 Opt out at any time: `brisk consent --revoke` or BRISK_CONTRIBUTE=0.
 '''
+
+def check_node(node='node'):
+    """Fail early, with the fix, when Node is missing or older than the decoder hosts support."""
+    advice = f'Install Node.js {MIN_NODE} or newer from https://nodejs.org, or pass the path to it.'
+    try:
+        out = subprocess.run([node, '--version'], capture_output=True, text=True, timeout=30).stdout
+    except FileNotFoundError:
+        raise BriskError(f'Node.js was not found (looked for {str(node)!r}). BRiSK\'s decoder runs under Node. {advice}') from None
+    except (OSError, subprocess.SubprocessError) as error:
+        raise BriskError(f'Could not run {str(node)!r} --version: {error}. {advice}') from error
+    found = re.match(r'v(\d+)\.', out.strip())
+    if found and int(found[1]) < MIN_NODE:
+        raise BriskError(f'Node.js {out.strip()} is too old; the decoder hosts need Node {MIN_NODE}+. {advice}')
+
 
 def settings(path=None):
     return json.loads((path or PACKAGE / 'archive.json').read_text())
@@ -211,6 +227,7 @@ def record_events(events, web=False, cache=None, codes=None, limit_frames=None, 
     Needs only Node. A Rust collector binary (`brisk_quote_ingest`) is optional; it
     records the same batches and adds its own state validation and latency display.
     """
+    check_node(node)
     options = ['--web'] if web else ['--cache', str(cache)]
     options += ['--speed', str(speed)]
     if codes:
@@ -250,7 +267,16 @@ def live(args):
         print(json.dumps({'contribution': feed.contribution}), file=sys.stderr)
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    try:
+        _main(argv)
+    except BriskError as error:
+        sys.exit(f'brisk: error: {error}')
+
+
+def _main(argv):
+    from briskapi import __version__
+    parser = argparse.ArgumentParser(prog='brisk', description=__doc__)
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     parser.add_argument('--config', type=Path, default=PACKAGE / 'archive.json')
     sub = parser.add_subparsers(dest='command', required=True)
     for name in ('record', 'package'):

@@ -4,18 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "briskapi"
-version = "0.2.0"
+version = "0.2.1"
 description = "Unofficial Python API, live feed and shared archive for BRiSK auction data"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = ["boto3>=1.41,<2"]
+keywords = ["brisk", "market-data", "auction", "tokyo-stock-exchange", "japan", "sbi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
 
 [project.optional-dependencies]
 pandas = ["pandas>=2"]
 
 [project.urls]
 Source = "https://github.com/honvl/BRiSKapi"
+Issues = "https://github.com/honvl/BRiSKapi/issues"
+Releases = "https://github.com/honvl/BRiSKapi/releases"
+Privacy = "https://github.com/honvl/BRiSKapi/blob/main/PRIVACY.md"
 
 [project.scripts]
 brisk = "briskapi.cli:main"
