@@ -1,12 +1,15 @@
 'use strict';
-// Passkey login for SBI through Chrome's virtual authenticator.
+// Passkey sign-in to a BRiSK site (SBI, Matsui, Monex, SMBC Nikko, ...) through Chrome's virtual
+// authenticator.
 //
 // A Chrome that this host starts and drives over a private DevTools *pipe* (never a TCP debugging
 // port, which any local process could attach to) carries a virtual authenticator holding the user's
 // passkey. The site's own passkey ceremony is answered without a touch, and the BRiSK session cookies
-// are handed back. Run it through `brisk sbi enroll` / `brisk sbi login`, not by hand: the request
-// arrives on stdin and the results (including the passkey's private key) leave on stdout as JSON
-// lines. Nothing secret is ever put on a command line or in a log message.
+// are handed back. It knows nothing about any particular site: the login URL, the passkey control's
+// text and the BRiSK cookie host all arrive in the request. Run it through `brisk enroll` /
+// `brisk login`, not by hand: the request arrives on stdin and the results (including the passkey's
+// private key) leave on stdout as JSON lines. Nothing secret is ever put on a command line or in a
+// log message.
 //
 //   request (first stdin line, JSON): {"mode": "enroll"|"login", "credential": {...}, ...options}
 //   stdout, one JSON object per line:
@@ -22,13 +25,13 @@ const readline = require('node:readline');
 
 class PasskeyError extends Error {}
 
-// Defaults for details that are not public: they are the first things to override when a step fails.
+// Only neutral defaults: which site to sign in to is always the caller's choice.
 const DEFAULTS = {
-  loginUrl: 'https://login.sbisec.co.jp/login/entry',
+  loginUrl: null,
   launchUrl: null,
-  cookieHost: 'sbi.brisk.jp',
-  cookiePrefix: 'session_',
-  passkeyButton: 'パスキー認証でログイン',
+  cookieHost: null,
+  cookiePrefix: '',
+  passkeyButton: 'パスキー',
   headless: false,
   profileDir: null,
   chrome: null,
@@ -52,11 +55,14 @@ function originOf(url) {
   try { return new URL(url).origin; } catch { return 'an invalid URL'; }
 }
 
-function resolveOptions(request) {
+function resolveOptions(request, mode) {
   const options = { ...DEFAULTS };
   for (const key of Object.keys(DEFAULTS)) {
     if (request[key] !== undefined && request[key] !== null) options[key] = request[key];
   }
+  if (!options.loginUrl) throw new PasskeyError('loginUrl is required');
+  if (mode === 'login' && !options.cookieHost) throw new PasskeyError('cookieHost is required');
+  if (options.cookieHost !== null && !/^[a-z0-9.-]+$/i.test(options.cookieHost)) throw new PasskeyError('cookieHost must be a host name');
   for (const key of ['loginUrl', 'launchUrl']) {
     if (options[key] === null) continue;
     let url;
@@ -73,7 +79,7 @@ function validateCredential(credential) {
   const fields = ['credentialId', 'privateKey', 'rpId'];
   if (!credential || typeof credential !== 'object' || fields.some((f) => typeof credential[f] !== 'string' || !credential[f])
       || credential.isResidentCredential !== true || !Number.isInteger(credential.signCount)) {
-    throw new PasskeyError('The stored passkey is not valid; run `brisk sbi enroll` again');
+    throw new PasskeyError('The stored passkey is not valid; run `brisk enroll --replace` again');
   }
 }
 
@@ -378,7 +384,7 @@ async function withBrowser(options, credential, ctx, work) {
 }
 
 async function login(request, ctx) {
-  const options = resolveOptions(request);
+  const options = resolveOptions(request, 'login');
   validateCredential(request.credential);
   return withBrowser(options, request.credential, ctx, async (browser) => {
     log(`Chrome started; signing in at ${originOf(options.loginUrl)}`);
@@ -393,7 +399,7 @@ async function login(request, ctx) {
       }
     }, () => {});
     try { await asserted; } catch (error) {
-      if (error.message.startsWith('Timed out')) throw new PasskeyError('The site never asked for the passkey; its login page may have changed (see passkeyButton and loginUrl)');
+      if (error.message.startsWith('Timed out')) throw new PasskeyError('The site never asked for the passkey; the passkey button text or the login URL may need changing');
       throw error;
     }
     log('The site asked for the passkey and it was signed');
@@ -403,21 +409,21 @@ async function login(request, ctx) {
       log(`Opening BRiSK at ${originOf(options.launchUrl)}`);
       await browser.navigate(options.launchUrl);
     } else if (!options.headless) {
-      log('Open BRiSK from the SBI site in the Chrome window');
+      log('Open BRiSK from the broker\'s site in the Chrome window');
     }
     const cookies = await browser.waitForCookies({ host: options.cookieHost, prefix: options.cookiePrefix, timeoutMs: options.cookieTimeoutMs });
     if (!cookies) {
       throw new PasskeyError(`No ${options.cookieHost} session cookie appeared. The login may have been refused`
-        + `${options.launchUrl ? '' : ', or BRiSK was not opened (set launchUrl)'}`);
+        + `${options.launchUrl ? '' : ', or BRiSK was not opened (give a launch URL)'}`);
     }
     return { cookies };
   });
 }
 
 async function enroll(request, ctx) {
-  const options = resolveOptions(request);
+  const options = resolveOptions(request, 'enroll');
   return withBrowser(options, null, ctx, async (browser, handle) => {
-    log(`Chrome started at ${originOf(options.loginUrl)}. Sign in, then register a passkey in SBI's security settings`);
+    log(`Chrome started at ${originOf(options.loginUrl)}. Sign in, then register a passkey in the site's security settings`);
     const added = browser.cdp.waitFor('WebAuthn.credentialAdded', () => true, options.enrollTimeoutMs);
     added.catch(() => {});
     await browser.navigate(options.loginUrl);
@@ -433,7 +439,7 @@ async function main(argv = process.argv.slice(2), env = {}) {
   const emit = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
   const finish = (result) => { emit({ type: 'result', ...result }); return result.ok ? 0 : 1; };
   if (process.stdout.isTTY || process.stdin.isTTY) {
-    process.stderr.write('brisk passkey: run this through `brisk sbi enroll` or `brisk sbi login`; it prints credentials\n');
+    process.stderr.write('brisk passkey: run this through `brisk enroll` or `brisk login`; it prints credentials\n');
     return 2;
   }
   const lines = readline.createInterface({ input: process.stdin });

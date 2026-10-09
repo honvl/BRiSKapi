@@ -95,16 +95,26 @@ test('only cookies of exactly the BRiSK host are returned', () => {
   assert.deepEqual(pickCookies([], 'sbi.brisk.jp'), {});
 });
 
+test('the host holds no site of its own: the caller names the login URL and the cookie host', () => {
+  assert.equal(DEFAULTS.loginUrl, null);
+  assert.equal(DEFAULTS.cookieHost, null);
+  assert.throws(() => resolveOptions({}, 'enroll'), /loginUrl is required/);
+  assert.throws(() => resolveOptions({ loginUrl: 'https://a.example/' }, 'login'), /cookieHost is required/);
+  assert.doesNotThrow(() => resolveOptions({ loginUrl: 'https://a.example/' }, 'enroll'));
+  assert.throws(() => resolveOptions({ loginUrl: 'https://a.example/', cookieHost: 'a.example/path' }, 'login'), /cookieHost must be a host name/);
+});
+
 test('options take defaults, accept overrides and refuse bad values', () => {
-  assert.deepEqual(resolveOptions({}), DEFAULTS);
-  const set = resolveOptions({ loginUrl: 'http://main.localhost:1/', launchUrl: null, headless: true, cookieTimeoutMs: 5 });
+  const base = { loginUrl: 'https://a.example/', cookieHost: 'x.brisk.jp' };
+  assert.deepEqual(resolveOptions(base, 'login'), { ...DEFAULTS, ...base });
+  const set = resolveOptions({ ...base, loginUrl: 'http://main.localhost:1/', launchUrl: null, headless: true, cookieTimeoutMs: 5 }, 'login');
   assert.equal(set.loginUrl, 'http://main.localhost:1/');
   assert.equal(set.launchUrl, null);
   assert.equal(set.headless, true);
-  assert.equal(set.cookieHost, 'sbi.brisk.jp');
-  assert.throws(() => resolveOptions({ loginUrl: 'nope' }), /loginUrl is not a valid URL/);
-  assert.throws(() => resolveOptions({ launchUrl: 'file:///etc/passwd' }), /launchUrl must be an http\(s\) URL/);
-  assert.throws(() => resolveOptions({ assertTimeoutMs: 0 }), /assertTimeoutMs must be a positive number/);
+  assert.equal(set.cookieHost, 'x.brisk.jp');
+  assert.throws(() => resolveOptions({ ...base, loginUrl: 'nope' }, 'login'), /loginUrl is not a valid URL/);
+  assert.throws(() => resolveOptions({ ...base, launchUrl: 'file:///etc/passwd' }, 'login'), /launchUrl must be an http\(s\) URL/);
+  assert.throws(() => resolveOptions({ ...base, assertTimeoutMs: 0 }, 'login'), /assertTimeoutMs must be a positive number/);
   assert.equal(originOf('https://sbi.brisk.jp/path?token=secret#x'), 'https://sbi.brisk.jp');
   assert.equal(originOf('nope'), 'an invalid URL');
 });
@@ -148,14 +158,16 @@ test('the stdin protocol reports a missing, malformed or unknown request as a fa
   assert.match(garbled.result.error, /not JSON/);
   const unknown = await runHelper('dance', {});
   assert.match(unknown.result.error, /Usage: passkey\.cjs enroll\|login/);
-  const invalid = await runHelper('login', { credential: { credentialId: 'x' } });
-  assert.match(invalid.result.error, /not valid; run `brisk sbi enroll` again/);
+  const invalid = await runHelper('login', { loginUrl: 'https://a.example/', cookieHost: 'x.brisk.jp', credential: { credentialId: 'x' } });
+  assert.match(invalid.result.error, /not valid; run `brisk enroll --replace` again/);
+  const unnamed = await runHelper('login', { credential: { credentialId: 'x' } });
+  assert.match(unnamed.result.error, /loginUrl is required/);
 });
 
 test('a Chrome that cannot start is a clear failure and leaves no profile behind', async () => {
   const before = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-'));
   const credential = { credentialId: 'a', privateKey: 'k', rpId: 'r', isResidentCredential: true, signCount: 1 };
-  const run = await runHelper('login', { credential, chrome: '/nonexistent/chrome' });
+  const run = await runHelper('login', { credential, chrome: '/nonexistent/chrome', loginUrl: 'https://a.example/', cookieHost: 'x.brisk.jp' });
   assert.equal(run.code, 1);
   assert.match(run.result.error, /Could not start Chrome \(ENOENT\)/);
   assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-')), before);
@@ -257,7 +269,7 @@ test('with launchUrl the helper opens BRiSK itself when the site stays on the ma
     const passkey = (await enrollOn(site)).credentials.at(-1);
     const without = await runHelper('login', { ...baseOptions(site, { cookieTimeoutMs: 3000 }), credential: passkey });
     assert.equal(without.result.ok, false);
-    assert.match(without.result.error, /BRiSK was not opened \(set launchUrl\)/);
+    assert.match(without.result.error, /BRiSK was not opened \(give a launch URL\)/);
     const saved = without.credentials.at(-1);
     const run = await runHelper('login', { ...baseOptions(site, { launchUrl: `${site.mainOrigin}/launch` }), credential: saved });
     assert.equal(run.result.ok, true, run.stderr);
@@ -274,7 +286,7 @@ test('a login page without the passkey control fails clearly instead of hanging'
     const passkey = (await enrollOn(site)).credentials.at(-1);
     const run = await runHelper('login', { ...baseOptions(site, { passkeyButton: 'no such button', assertTimeoutMs: 3000, clickWaitMs: 1500 }), credential: passkey });
     assert.equal(run.result.ok, false);
-    assert.match(run.result.error, /never asked for the passkey.*passkeyButton and loginUrl/);
+    assert.match(run.result.error, /never asked for the passkey.*button text or the login URL/);
     assert.match(run.stderr, /No "no such button" control found on the login page/);
   } finally { site.close(); }
 });

@@ -88,7 +88,8 @@ briskapi.Market().snapshot(at="09:00:00").to_pandas()
 BRiSK を契約している SBI証券のお客様向けです。ブラウザで
 [sbi.brisk.jp](https://sbi.brisk.jp) にログインし、そのセッション Cookie を
 渡します。Cookie は DevTools からコピーするか、`pycookiecheat` の
-`chrome_cookies("https://sbi.brisk.jp")` で取得できます。
+`chrome_cookies("https://sbi.brisk.jp")` で取得できます。パスキーで `briskapi` に
+サインインさせることもできます（[下記](#パスキーでのサインイン試験的)）。
 
 ```python
 from briskapi import sbi
@@ -115,31 +116,6 @@ toyota.quote()                              # 他のフィードと同じ呼び�
 必要）、`briskapi.NotFoundError`、`sbi.RateLimitError`、`sbi.APIError` です。
 リクエストは1秒に1回までに制限しています。
 
-### パスキーでのサインイン（試験的）
-
-SBI証券の口座でパスキーを使っている場合、Cookie をコピーする代わりに `briskapi` が
-サインインできます。Chrome、Node 22 以上、そしてパスキーの保管先として macOS の
-キーチェーンが必要です。Chrome は仮想オーセンティケーターを備えて起動され、一度だけ
-登録したパスキーを保持して、SBI のサインインにタッチなしで応答します。
-
-```sh
-brisk sbi enroll   # 初回のみ: Chrome の画面で手動サインインし、SBI のセキュリティ設定でパスキーを登録。
-                   # 登録完了の表示が出たら Enter を押す
-brisk sbi login    # 毎回: Chrome がサインインし、`brisk live --sbi` 用に BRiSK の Cookie を保存
-brisk sbi forget   # 保存したパスキーを削除（SBI の設定でも削除してください）
-```
-
-Python では `sbi.passkey_login()` が `sbi.login(cookies=...)` と同じ働きをし、クライアントを
-返します。パスキーは認証情報です。持っている人は誰でも SBI の口座にサインインできます。
-パスキーはキーチェーンにのみ保存され（`BRISK_PASSKEY_STORE=file` なら本人のみ読み取り可の
-ファイルに保存しますが、安全性は下がります）、お使いのマシンの外には出ず、ログにも表示
-されません。`--launch-url` を指定しない場合は、サインイン後に Chrome の画面で SBI のサイトから
-BRiSK を開きます。SBI のサインインページと BRiSK の起動は実際の口座では未検証のため、
-`--login-url`、`--passkey-button`、`--launch-url` で上書きできます。うまくいかない点は
-ぜひお知らせください。Chrome は自動操作されていることをサイトに伝えるため、SBI に拒否される
-可能性があります。利用前に、SBI の規約でこの使い方が認められているかご確認ください。
-詳細は [ARCHITECTURE.md](https://github.com/honvl/BRiSKapi/blob/main/ARCHITECTURE.md#passkey-sign-in) を参照してください。
-
 ライブフィードは、ご自身のセッションでダウンロードした SBI 自身のデコーダーを
 Node 上で動かします。ブラウザは使いません。ベンダーのクライアントと同じ接続手順
 （最初のフレームからデコーダーに入力し、スナップショットをストリームに追いつかせ、
@@ -153,6 +129,74 @@ Node 上で動かします。ブラウザは使いません。ベンダーのク
 データは、その記録の開始時に明示的に同意した場合だけ共有します。Python API では
 `share_market_data=True` が必要です。共有がオンなら、市場データの共有を断っても
 タイミングの要約は共有します。
+
+## パスキーでのサインイン（試験的）
+
+近年は、パスキーでのサインインを求める証券会社が増えています。お使いの証券会社がそうなら、
+Cookie をブラウザからコピーする代わりに、`briskapi` がサインインして BRiSK のセッション
+Cookie を保存できます。SBI証券、松井証券、マネックス証券、SMBC日興証券の BRiSK に対応し、
+他の証券会社も追加できます。Chrome、Node 22 以上、macOS のキーチェーンが必要です。
+
+### 仕組み
+
+パスキーは1組の鍵です。公開鍵は証券会社が持ち、秘密鍵は通常、スマートフォンやパソコン、
+パスワードマネージャーの中にあります。指紋や PIN で秘密鍵が使われ、証券会社が送る
+チャレンジに署名することで、本人であることを証明します。`briskapi` はこの仕組みを借ります。
+専用の Chrome を起動し、その Chrome が持つ*仮想オーセンティケーター*（スマートフォンの代わりを
+務め、確認なしで署名するソフトウェア）が署名します。証券会社のサイトは、その違いを見分け
+られません。
+
+1. **初回のみ `brisk enroll`。** 証券会社を選ぶと、別の Chrome ウィンドウがそのログインページで
+   開きます（普段の Chrome ではなく、一時的なプロファイルです）。いつもどおりサインインし、
+   新しいスマートフォンに登録するときと同じように、証券会社のセキュリティ設定でパスキーを
+   登録します。仮想オーセンティケーターがそれを受け取ります。サイトに登録完了と表示された
+   ら、ターミナルで Enter を押してください。`briskapi` がパスキーと選んだ証券会社をキー
+   チェーンに保存し、Chrome は閉じます。
+2. **毎回 `brisk login`。** 保存したパスキーを読み込んだ同じ Chrome が開き、ログインページで
+   パスキーのボタンを押すと、仮想オーセンティケーターが署名します。そのウィンドウで証券会社の
+   サイトから BRiSK を開いてください（`--launch-url` を指定すれば自動で開きます）。`briskapi` が
+   BRiSK のセッション Cookie を読み取って保存し、Chrome を閉じます。
+3. **あとは使うだけ。** SBI証券では、保存した Cookie を `brisk live --sbi` と `briskapi.sbi`
+   API が使います。他の証券会社には `briskapi` のデータクライアントがまだないため、Cookie は
+   ご自身の利用のために保存される（`~/.config/brisk/cookies/`）だけです。
+
+スマートフォンやパスワードマネージャーにある既存のパスキーには手を加えません。証券会社の
+一覧にパスキーが1つ増えるだけで、セキュリティ設定からいつでも削除できます。
+
+### 注意点
+
+- **保存したパスキーは認証情報です。** 持っている人は誰でも、追加の確認なしにあなたの
+  証券口座へサインインできます。パスキーはキーチェーンにのみ保存され（`BRISK_PASSKEY_STORE=file`
+  なら本人のみ読み取り可のファイルに保存しますが、安全性は下がります）、お使いのマシンの外には
+  出ず、ログにも表示されません。`brisk forget` でここから削除できます。証券会社側でも削除して
+  ください。
+- **試験的な機能です。** 各証券会社のログインページ、パスキーボタンの文言、BRiSK の起動方法は
+  公開ページをもとにしたもので、実際の口座では試していません。`--login-url`、`--passkey-button`、
+  `--launch-url` や下記の `sites.json` で上書きでき、うまくいかない点はぜひお知らせください。
+- **証券会社に拒否される可能性があります。** Chrome は自動操作されていることをサイトに伝えます。
+  利用前に、証券会社の規約でこの使い方が認められているかご確認ください。
+
+### コマンド
+
+```sh
+brisk sites                    # 選べる証券会社と BRiSK のアドレス
+brisk enroll [--site matsui]   # 初回のみ。指定しなければ証券会社を選ぶよう求められます
+brisk login                    # 毎回。enroll で登録した証券会社にサインインします
+brisk forget                   # 保存したパスキーを削除
+```
+
+Python では `passkey.enroll(site="matsui")` と `signin = passkey.login()` を使います。
+`signin.cookies` が BRiSK の Cookie、`signin.client` がデータクライアントのある証券会社での
+クライアントです。
+
+証券会社を追加したり、組み込みの設定を直したりするには、`~/.config/brisk/sites.json` を編集します。
+
+```json
+{"sites": [{"id": "mybroker", "name": "My Broker", "login_url": "https://broker.example/login",
+            "cookie_host": "mybroker.brisk.jp", "passkey_button": "パスキーでログイン"}]}
+```
+
+内部の仕組みは [ARCHITECTURE.md](https://github.com/honvl/BRiSKapi/blob/main/ARCHITECTURE.md#passkey-sign-in) を参照してください。
 
 ## API リファレンス
 
@@ -173,7 +217,8 @@ Node 上で動かします。ブラウザは使いません。ベンダーのク
 | `briskapi.consent(...)` | 共有の設定 |
 | `Ticker(code).candles(interval)` / `.margin(days)` | SBI BRiSK のローソク足、信用残と貸株料 |
 | `Market().turnover()` / `.lists()` / `.events()` / `.schedule()` / `.watchlist()` | SBI BRiSK の市場データ |
-| `briskapi.sbi.login()` / `.passkey_login()` / `.connect()` | SBI BRiSK のセッション（Cookie またはパスキー）とライブフィード |
+| `briskapi.sbi.login()` / `.connect()` | SBI BRiSK のセッションとライブフィード |
+| `briskapi.passkey.enroll()` / `.login()` / `.forget()` | 証券会社の BRiSK へのパスキーでのサインイン |
 
 価格は円単位の浮動小数点数で、ベンダーの「値なし」（0）は `None` になります。
 時刻は取引日の日本時間の `datetime` です。数量は株数で、売買区分・フラグ・
@@ -187,8 +232,8 @@ Node 上で動かします。ブラウザは使いません。ベンダーのク
 
 ```sh
 brisk live --web --codes 7203,6758          # 気配の更新ごとに JSON を1行出力（--raw でベンダー形式）
-brisk sbi enroll | login | forget          # Chrome 経由のパスキーでの SBI サインイン（試験的）
-brisk live --sbi --codes 7203               # SBI BRiSK。Cookie は BRISK_SBI_COOKIES（JSON）から。--trace-protocol で接続手順を表示（通信の詳細は BRISK_SBI_PROFILE）
+brisk sites | enroll | login | forget       # Chrome 経由のパスキーで証券会社の BRiSK にサインイン（試験的）
+brisk live --sbi --codes 7203               # SBI BRiSK。Cookie は BRISK_SBI_COOKIES（JSON）または `brisk login` が保存したもの。--trace-protocol で接続手順を表示（通信の詳細は BRISK_SBI_PROFILE）
 brisk record --web --output recordings/s1   # デモを記録（同意済みなら共有）
 brisk list --date 20210927 --source historical_mock
 brisk pull PREFIX --output recordings/downloaded   # brisk list が返した prefix を使う

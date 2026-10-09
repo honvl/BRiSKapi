@@ -84,7 +84,8 @@ uses the SBI wire format for protocol research and requires a wire-format decode
 For SBI Securities customers with a BRiSK subscription. Log in on
 [sbi.brisk.jp](https://sbi.brisk.jp) in your browser, then pass its session
 cookies: copy them from DevTools, or use `pycookiecheat`'s
-`chrome_cookies("https://sbi.brisk.jp")`.
+`chrome_cookies("https://sbi.brisk.jp")`. Or let `briskapi` sign in with your passkey
+([below](#signing-in-with-a-passkey-experimental)).
 
 ```python
 from briskapi import sbi
@@ -111,29 +112,6 @@ Results use the conventions below. Errors are `sbi.SessionExpiredError` (log in
 again), `briskapi.NotFoundError`, `sbi.RateLimitError` and `sbi.APIError`.
 Requests are limited to one per second.
 
-### Signing in with a passkey (experimental)
-
-If your SBI account uses a passkey, `briskapi` can sign in for you instead of you
-copying cookies. It needs Chrome, Node 22+ and, to keep the passkey, the macOS
-Keychain. Chrome runs with a built-in virtual authenticator that holds the passkey
-you register once, and answers SBI's sign-in without a touch.
-
-```sh
-brisk sbi enroll   # once: sign in by hand in the Chrome window and register a passkey in SBI's
-                   # security settings; press Enter when SBI says it is registered
-brisk sbi login    # each session: Chrome signs in and the BRiSK cookies are kept for `brisk live --sbi`
-brisk sbi forget   # delete the saved passkey (remove it in SBI's settings too)
-```
-
-From Python, `sbi.passkey_login()` does the same as `sbi.login(cookies=...)` and returns the
-client. The passkey is a credential: whoever has it can sign in to your SBI account. It is
-kept only in the Keychain (`BRISK_PASSKEY_STORE=file` keeps it in an owner-only file instead,
-which is weaker), never leaves your machine, and is never shown in a log. Without `--launch-url`
-you open BRiSK from the SBI site in the Chrome window after it signs you in. SBI's sign-in page
-and BRiSK launch haven't been verified against a live account, so `--login-url`,
-`--passkey-button` and `--launch-url` are overridable; please report what fails. Chrome tells the site
-it is being automated, so SBI may refuse it. Check that SBI's terms allow this before relying on it. See [ARCHITECTURE.md](https://github.com/honvl/BRiSKapi/blob/main/ARCHITECTURE.md#passkey-sign-in).
-
 The live feed runs SBI's own decoder under Node, downloaded with your session;
 no browser is involved. It follows the vendor client's connect sequence: it feeds
 the decoder from the first frame, catches the snapshot up to the stream, forwards
@@ -147,6 +125,72 @@ explicit error rather than guessing. Please report what you see. Your cookies go
 only to sbi.brisk.jp. SBI market data is shared only after an explicit choice for
 that capture; the Python API requires `share_market_data=True`. With contribution
 on, a timing summary is shared even when market-data sharing is declined.
+
+## Signing in with a passkey (experimental)
+
+Many brokers now have you sign in with a passkey. If yours does, `briskapi` can do the
+sign-in for you and keep the BRiSK session cookies, instead of you copying them from a
+browser. It works with the BRiSK sites of SBI, Matsui, Monex and SMBC Nikko, or any broker you
+add, and needs Chrome, Node 22+ and the macOS Keychain.
+
+### How it works
+
+A passkey is a pair of keys. The broker keeps the public half. The private half normally lives
+in your phone, laptop or password manager, where a fingerprint or PIN lets it sign a challenge
+the broker sends, which proves it is you. `briskapi` borrows that arrangement. It starts its own
+Chrome, which has a *virtual authenticator*: software that plays the part of your phone and signs
+without asking. The broker's site cannot tell the difference.
+
+1. **Once, `brisk enroll`.** You pick your broker. A separate Chrome window opens on its login
+   page (a temporary profile, not your everyday Chrome). Sign in as you normally would, then
+   register a new passkey in the broker's security settings, just as you would for a new phone.
+   The virtual authenticator receives it. When the site says it is registered, press Enter in
+   the terminal: `briskapi` saves the passkey and your broker choice in the macOS Keychain, and
+   Chrome closes.
+2. **Each session, `brisk login`.** The same Chrome opens with the saved passkey loaded, goes to the
+   login page and presses the passkey button, and the virtual authenticator signs. Open BRiSK from
+   the broker's site in that window (or pass `--launch-url` to have it opened for you).
+   `briskapi` reads the BRiSK session cookies, saves them and closes Chrome.
+3. **Then use it.** For SBI, `brisk live --sbi` and the `briskapi.sbi` API use the saved cookies.
+   For the other brokers `briskapi` has no data client yet, so the cookies are only saved
+   (under `~/.config/brisk/cookies/`) for your own use.
+
+Your existing passkeys on your phone or in a password manager are not touched. The broker simply
+lists one more passkey, which you can delete in its security settings.
+
+### What to know
+
+- **The saved passkey is a credential.** Whoever has it can sign in to your broker account with no
+  further check. It is kept only in the Keychain (`BRISK_PASSKEY_STORE=file` keeps it in an
+  owner-only file instead, which is weaker), never leaves your machine and is never shown in a
+  log. `brisk forget` deletes it here; remove it at the broker too.
+- **It is experimental.** Each broker's login page, passkey button text and BRiSK launch come from
+  its public pages, and none has been tried against a live account. Override them with
+  `--login-url`, `--passkey-button` and `--launch-url`, or in `sites.json` below, and please report
+  what fails.
+- **A broker may refuse it.** Chrome tells the site it is being automated. Check that your
+  broker's terms allow this before relying on it.
+
+### Commands
+
+```sh
+brisk sites                    # the brokers you can pick, and where their BRiSK lives
+brisk enroll [--site matsui]   # once; you are asked to choose a broker if you don't say
+brisk login                    # each session; the broker is the one you enrolled with
+brisk forget                   # delete the saved passkey
+```
+
+From Python: `passkey.enroll(site="matsui")` and `signin = passkey.login()`, where
+`signin.cookies` are the BRiSK cookies and `signin.client` is the data client for sites that have one.
+
+To add a broker, or correct a built-in one, edit `~/.config/brisk/sites.json`:
+
+```json
+{"sites": [{"id": "mybroker", "name": "My Broker", "login_url": "https://broker.example/login",
+            "cookie_host": "mybroker.brisk.jp", "passkey_button": "Sign in with a passkey"}]}
+```
+
+How it works inside: [ARCHITECTURE.md](https://github.com/honvl/BRiSKapi/blob/main/ARCHITECTURE.md#passkey-sign-in).
 
 ## API reference
 
@@ -167,7 +211,8 @@ on, a timing summary is shared even when market-data sharing is declined.
 | `briskapi.consent(...)` | Your sharing choice |
 | `Ticker(code).candles(interval)` / `.margin(days)` | SBI BRiSK price bars; margin balances and lending fees |
 | `Market().turnover()` / `.lists()` / `.events()` / `.schedule()` / `.watchlist()` | SBI BRiSK market data |
-| `briskapi.sbi.login()` / `.passkey_login()` / `.connect()` | SBI BRiSK session (cookies or passkey) and live feed |
+| `briskapi.sbi.login()` / `.connect()` | SBI BRiSK session and live feed |
+| `briskapi.passkey.enroll()` / `.login()` / `.forget()` | Passkey sign-in to your broker's BRiSK |
 
 Prices are yen floats, with `None` for the vendor's zero "unavailable" value.
 Times are JST `datetime`s on the trading date. Quantities are shares; side, flag
@@ -181,8 +226,8 @@ recording once (about six seconds for the complete 420 MB demo).
 
 ```sh
 brisk live --web --codes 7203,6758          # one JSON object per quote update (--raw for vendor fields)
-brisk sbi enroll | login | forget          # SBI sign-in with a passkey through Chrome (experimental)
-brisk live --sbi --codes 7203               # SBI BRiSK; cookies from BRISK_SBI_COOKIES (JSON); --trace-protocol shows the handshake, wire details in BRISK_SBI_PROFILE
+brisk sites | enroll | login | forget       # sign in to your broker's BRiSK with a passkey through Chrome (experimental)
+brisk live --sbi --codes 7203               # SBI BRiSK; cookies from BRISK_SBI_COOKIES (JSON) or `brisk login`; --trace-protocol shows the handshake, wire details in BRISK_SBI_PROFILE
 brisk record --web --output recordings/s1   # record a replay (shared if you agreed)
 brisk list --date 20210927 --source historical_mock
 brisk pull PREFIX --output recordings/downloaded   # use a prefix returned by brisk list

@@ -301,21 +301,27 @@ def live(args):
     if feed.timing_contribution:
         print(json.dumps({'timing_contribution': feed.timing_contribution}), file=sys.stderr)
 
-def sbi_passkey(args):
-    """`brisk sbi enroll|login|forget`: SBI BRiSK sign-in with a passkey held in a Chrome virtual authenticator."""
-    from briskapi import sbi
-    if args.sbi_command == 'enroll':
-        print(json.dumps(sbi.passkey_enroll(login_url=args.login_url, chrome=args.chrome, profile_dir=args.profile_dir,
-                                            replace=args.replace)))
-    elif args.sbi_command == 'login':
-        sbi.passkey_login(remember=args.remember, login_url=args.login_url, launch_url=args.launch_url,
-                          passkey_button=args.passkey_button, chrome=args.chrome, profile_dir=args.profile_dir,
-                          headless=args.headless)
-        saved = f'saved to {sbi.cookies_path()}' if args.remember else 'not saved'
-        print(f'Signed in to SBI BRiSK; session cookies {saved}.', file=sys.stderr)
+def passkey_command(args):
+    """`brisk sites|enroll|login|forget`: sign in to your broker's BRiSK with a passkey held in a Chrome virtual authenticator."""
+    from briskapi import passkey, sites
+    if args.command == 'sites':
+        for site in sites.load_sites().values():
+            client = 'data client: yes' if site.client else 'data client: no'
+            print(f'{site.id:<10} {site.name:<24} {site.cookie_host:<22} {client:<16} {site.source}')
+    elif args.command == 'enroll':
+        print(json.dumps(passkey.enroll(site=args.site, login_url=args.login_url, chrome=args.chrome, profile_dir=args.profile_dir,
+                                        replace=args.replace)))
+    elif args.command == 'login':
+        signin = passkey.login(remember=args.remember, login_url=args.login_url, launch_url=args.launch_url,
+                               passkey_button=args.passkey_button, chrome=args.chrome, profile_dir=args.profile_dir,
+                               headless=args.headless)
+        saved = f'saved to {signin.saved_to}' if signin.saved_to else 'not saved'
+        print(f'Signed in to {signin.site.name}; session cookies {saved}.', file=sys.stderr)
+        if signin.client is None:
+            print('briskapi has no data client for this site yet: the cookies are for your own use.', file=sys.stderr)
     else:
-        sbi.passkey_forget()
-        print('Passkey deleted here. It stays registered at SBI until you remove it in SBI\'s security settings.',
+        passkey.forget()
+        print('Passkey deleted here. It stays registered at your broker until you remove it in its security settings.',
               file=sys.stderr)
 
 def main(argv=None):
@@ -359,28 +365,28 @@ def _main(argv):
     p.add_argument('--limit-frames', type=int)
     p.add_argument('--raw', action='store_true', help='Vendor fields (price10, microseconds) instead of yen/ISO times')
     group.add_argument('--sbi', action='store_true',
-                       help='Live SBI BRiSK (experimental); cookies from BRISK_SBI_COOKIES or saved with sbi.login(remember=True)')
+                       help='Live SBI BRiSK (experimental); cookies from BRISK_SBI_COOKIES, saved with sbi.login(remember=True) or by `brisk login`')
     p.add_argument('--trace-protocol', action='store_true',
                    help='With --sbi: print the connection steps to stderr, every token redacted (wire details in BRISK_SBI_PROFILE)')
     p.add_argument('--share-market-data', action=argparse.BooleanOptionalAction, default=None,
                    help='With --sbi and consent: share this decoded market session (interactive default: ask, Enter accepts)')
-    p = sub.add_parser('sbi', help='Sign in to SBI BRiSK with a passkey, through Chrome (experimental)')
-    steps = p.add_subparsers(dest='sbi_command', required=True)
-    for name, text in (('enroll', 'Once: sign in by hand and register a passkey in SBI; it is saved to the Keychain'),
+    sub.add_parser('sites', help='List the brokers you can sign in to (built in, plus your own in sites.json)')
+    for name, text in (('enroll', 'Once: pick your broker, sign in by hand and register a passkey; it is saved to the Keychain'),
                        ('login', 'Sign in with the saved passkey in Chrome and keep the BRiSK session cookies')):
-        q = steps.add_parser(name, help=text)
-        q.add_argument('--login-url', help='Where to start (default: SBI\'s login page)')
-        q.add_argument('--chrome', type=Path, help='Chrome or Chromium executable (default: found automatically, or BRISK_CHROME)')
-        q.add_argument('--profile-dir', type=Path, help='Keep Chrome\'s profile here instead of a temporary one deleted afterwards')
+        p = sub.add_parser(name, help=text)
+        p.add_argument('--login-url', help='Where to start (default: the chosen broker\'s login page)')
+        p.add_argument('--chrome', type=Path, help='Chrome or Chromium executable (default: found automatically, or BRISK_CHROME)')
+        p.add_argument('--profile-dir', type=Path, help='Keep Chrome\'s profile here instead of a temporary one deleted afterwards')
         if name == 'enroll':
-            q.add_argument('--replace', action='store_true', help='Replace the passkey already saved')
+            p.add_argument('--site', help='Your broker (see `brisk sites`); asked interactively if omitted')
+            p.add_argument('--replace', action='store_true', help='Replace the passkey already saved')
         else:
-            q.add_argument('--launch-url', help='Open this BRiSK address after signing in (otherwise open BRiSK from the SBI site yourself)')
-            q.add_argument('--passkey-button', help='Text of the passkey sign-in control on the login page')
-            q.add_argument('--headless', action='store_true', help='No Chrome window: needs --launch-url and a login page that works unattended')
-            q.add_argument('--remember', action=argparse.BooleanOptionalAction, default=True,
-                           help='Save the cookies for `brisk live --sbi` (default: yes; owner-only file)')
-    steps.add_parser('forget', help='Delete the saved passkey (it stays registered at SBI until you remove it there)')
+            p.add_argument('--launch-url', help='Open this BRiSK address after signing in (otherwise open BRiSK from the broker\'s site yourself)')
+            p.add_argument('--passkey-button', help='Text of the passkey sign-in control on the login page')
+            p.add_argument('--headless', action='store_true', help='No Chrome window: needs --launch-url and a login page that works unattended')
+            p.add_argument('--remember', action=argparse.BooleanOptionalAction, default=True,
+                           help='Save the cookies (default: yes; owner-only file); SBI\'s feed `brisk live --sbi` reads them')
+    sub.add_parser('forget', help='Delete the saved passkey (it stays registered at your broker until you remove it there)')
     p = sub.add_parser('upload', help='Contribute a prepared package'); p.add_argument('directory', type=Path)
     p = sub.add_parser('list', help='List published recordings'); p.add_argument('--date'); p.add_argument('--source', choices=['historical_mock','synthetic_test','sbi_live'])
     p = sub.add_parser('pull', help='Download and verify a recording'); p.add_argument('prefix'); p.add_argument('--output', type=Path, required=True)
@@ -425,8 +431,8 @@ def _main(argv):
             print(json.dumps(contribute(args.output, config['api_url'], verify=False)))
     elif args.command == 'live':
         live(args)
-    elif args.command == 'sbi':
-        sbi_passkey(args)
+    elif args.command in {'sites', 'enroll', 'login', 'forget'}:
+        passkey_command(args)
     elif args.command == 'upload':
         print(json.dumps(contribute(args.directory, config['api_url'])))
     elif args.command == 'list':
