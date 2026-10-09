@@ -43,3 +43,18 @@ jobs:
           BRISK_MOCK_CACHE: /tmp/brisk-mock-cache
       - run: cargo fmt --manifest-path rust/brisk_quote_ingest/Cargo.toml --check
       - run: cargo clippy --locked --manifest-path rust/brisk_quote_ingest/Cargo.toml --all-targets -- -D warnings
+  # The passkey sign-in has Windows-only code (Credential Manager, UTF-8 handling, how the helper is stopped)
+  # that the Linux job cannot exercise, so its tests run on Windows too, in a real Chrome.
+  passkey-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt -e .
+      - run: python -m pytest tests/test_passkey.py tests/test_sites.py
+      - run: node --test tools/brisk_mock/passkey.test.cjs

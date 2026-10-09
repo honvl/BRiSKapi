@@ -10,7 +10,7 @@ const path = require('node:path');
 const readline = require('node:readline');
 const { PassThrough } = require('node:stream');
 const { spawn, execFileSync } = require('node:child_process');
-const { Cdp, findChrome, pickCookies, originOf, resolveOptions, validateCredential, DEFAULTS, PasskeyError } = require('../../briskapi/decoder/passkey.cjs');
+const { Cdp, findChrome, pickCookies, originOf, resolveOptions, validateCredential, sweepStaleProfiles, DEFAULTS, PasskeyError } = require('../../briskapi/decoder/passkey.cjs');
 
 const HELPER = path.join(__dirname, '..', '..', 'briskapi', 'decoder', 'passkey.cjs');
 
@@ -79,7 +79,19 @@ test('Chrome is found by override, by the usual macOS paths, or on the Linux PAT
   assert.equal(findChrome({ env: { HOME: '/Users/u' }, platform: 'darwin', exists: only(`/Users/u${mac}`) }), `/Users/u${mac}`);
   assert.equal(findChrome({ env: { PATH: '/a:/b' }, platform: 'linux', exists: only('/b/chromium') }), '/b/chromium');
   assert.throws(() => findChrome({ env: { PATH: '/a' }, platform: 'linux', exists: only() }), /Chrome \(or Chromium\) was not found.*BRISK_CHROME/);
-  assert.throws(() => findChrome({ env: {}, platform: 'win32', exists: only() }), /macOS and Linux, not win32/);
+  assert.throws(() => findChrome({ env: {}, platform: 'freebsd', exists: only() }), /macOS, Linux and Windows, not freebsd/);
+});
+
+test('on Windows Chrome is found under Program Files, Program Files (x86) or the user profile', () => {
+  const env = { ProgramFiles: 'C:\\Program Files', 'ProgramFiles(x86)': 'C:\\Program Files (x86)', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' };
+  const at = (root) => `${root}\\Google\\Chrome\\Application\\chrome.exe`;
+  const only = (...present) => (p) => present.includes(p);
+  assert.equal(findChrome({ env, platform: 'win32', exists: only(at('C:\\Program Files')) }), at('C:\\Program Files'));
+  assert.equal(findChrome({ env, platform: 'win32', exists: only(at('C:\\Program Files (x86)')) }), at('C:\\Program Files (x86)'));
+  assert.equal(findChrome({ env, platform: 'win32', exists: only(at('C:\\Users\\u\\AppData\\Local')) }), at('C:\\Users\\u\\AppData\\Local'));
+  assert.equal(findChrome({ env: { BRISK_CHROME: 'D:\\chrome\\chrome.exe' }, platform: 'win32', exists: only('D:\\chrome\\chrome.exe') }), 'D:\\chrome\\chrome.exe');
+  assert.throws(() => findChrome({ env, platform: 'win32', exists: only() }), /Chrome \(or Chromium\) was not found.*BRISK_CHROME/);
+  assert.throws(() => findChrome({ env: {}, platform: 'win32', exists: () => true }), /was not found/, 'with no Windows folders known there is nothing to look in');
 });
 
 test('only cookies of exactly the BRiSK host are returned', () => {
@@ -117,6 +129,32 @@ test('options take defaults, accept overrides and refuse bad values', () => {
   assert.throws(() => resolveOptions({ ...base, assertTimeoutMs: 0 }, 'login'), /assertTimeoutMs must be a positive number/);
   assert.equal(originOf('https://sbi.brisk.jp/path?token=secret#x'), 'https://sbi.brisk.jp');
   assert.equal(originOf('nope'), 'an invalid URL');
+});
+
+test('a profile left by a helper that was force-killed is removed at the next start, and live or young ones are not', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-test-'));
+  try {
+    const make = (name, owner, ageMs = 0) => {
+      const dir = path.join(tmp, name);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, 'Cookies'), 'x');
+      if (owner !== null) fs.writeFileSync(path.join(dir, 'brisk-owner.pid'), String(owner));
+      const when = new Date(Date.now() - ageMs);
+      fs.utimesSync(dir, when, when);
+      return dir;
+    };
+    const dead = make('brisk-passkey-dead', 424242);
+    const live = make('brisk-passkey-live', process.pid);
+    const youngUnowned = make('brisk-passkey-young', null, 1000);
+    const oldUnowned = make('brisk-passkey-old', null, 5 * 60_000);
+    const unrelated = make('someone-elses-dir', 424242);
+    const garbled = make('brisk-passkey-garbled', 'abc', 5 * 60_000);
+    const removed = sweepStaleProfiles({ tmp, now: Date.now(), alive: (pid) => pid === process.pid });
+    assert.deepEqual(removed.sort(), ['brisk-passkey-dead', 'brisk-passkey-garbled', 'brisk-passkey-old']);
+    for (const kept of [live, youngUnowned, unrelated]) assert.ok(fs.existsSync(kept), `${kept} must be kept`);
+    for (const gone of [dead, oldUnowned, garbled]) assert.ok(!fs.existsSync(gone), `${gone} must be removed`);
+    assert.deepEqual(sweepStaleProfiles({ tmp: path.join(tmp, 'missing') }), [], 'a missing temp folder is not an error');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
 
 test('a stored passkey that is not a resident credential is refused before Chrome starts', () => {
@@ -170,7 +208,8 @@ test('a Chrome that cannot start is a clear failure and leaves no profile behind
   const run = await runHelper('login', { credential, chrome: '/nonexistent/chrome', loginUrl: 'https://a.example/', cookieHost: 'x.brisk.jp' });
   assert.equal(run.code, 1);
   assert.match(run.result.error, /Could not start Chrome \(ENOENT\)/);
-  assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-')), before);
+  // The start-up sweep may also remove an old leftover, so only a profile that did not exist before counts.
+  assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-') && !before.includes(n)), []);
   assert.doesNotMatch(run.stderr + JSON.stringify(run.messages), /"k"/);
 });
 
@@ -195,9 +234,22 @@ async function enrollOn(site) {
   return run;
 }
 
+// Chrome's helper processes can outlive its main process by a moment (longer on Windows), so poll.
+async function assertNoLeftovers(message = 'Chrome with the ephemeral profile is still running') {
+  let count = leftovers();
+  for (let attempt = 0; count > 0 && attempt < 40; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    count = leftovers();
+  }
+  assert.equal(count, 0, message);
+}
+
+// How many Chrome processes started by the helper (they carry its temporary profile name) are still running.
 function leftovers() {
-  const ps = execFileSync('ps', ['-axo', 'command']).toString();
-  return ps.split('\n').filter((line) => line.includes('--user-data-dir=') && line.includes('brisk-passkey-')).length;
+  const listing = process.platform === 'win32'
+    ? execFileSync('powershell.exe', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process | ForEach-Object { $_.CommandLine }"], { maxBuffer: 64 << 20 }).toString()
+    : execFileSync('ps', ['-axo', 'command']).toString();
+  return listing.split('\n').filter((line) => line.includes('--user-data-dir=') && line.includes('brisk-passkey-')).length;
 }
 
 test('enrolling captures the passkey the site registered, and the profile and Chrome are gone afterwards', e2e, async () => {
@@ -213,7 +265,7 @@ test('enrolling captures the passkey the site registered, and the profile and Ch
     assert.equal(passkey.isResidentCredential, true);
     assert.ok(passkey.privateKey.length > 100);
     assert.ok(site.registered);
-    assert.equal(leftovers(), 0, 'Chrome with the ephemeral profile is still running');
+    await assertNoLeftovers();
     assert.doesNotMatch(run.stderr, new RegExp(passkey.privateKey.slice(0, 40)));
     assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-')), []);
   } finally { site.close(); }
@@ -236,7 +288,7 @@ test('login signs the site in, returns only the BRiSK cookies and the advanced p
     assert.equal(advanced.signCount, site.counter, 'the saved counter must equal the one the site saw');
     for (const secret of [first.privateKey, site.briskCookieValue]) assert.ok(!run.stderr.includes(secret), 'a secret reached the log');
     assert.doesNotMatch(run.stderr, /v2\.local|token=|ticket=/);
-    assert.equal(leftovers(), 0);
+    await assertNoLeftovers();
   } finally { site.close(); }
 });
 
@@ -284,9 +336,48 @@ test('a login page without the passkey control fails clearly instead of hanging'
   await site.listen();
   try {
     const passkey = (await enrollOn(site)).credentials.at(-1);
-    const run = await runHelper('login', { ...baseOptions(site, { passkeyButton: 'no such button', assertTimeoutMs: 3000, clickWaitMs: 1500 }), credential: passkey });
+    const run = await runHelper('login', { ...baseOptions(site, { passkeyButton: 'no such button', assertTimeoutMs: 12_000, clickWaitMs: 1500 }), credential: passkey });
     assert.equal(run.result.ok, false);
     assert.match(run.result.error, /never asked for the passkey.*button text or the login URL/);
     assert.match(run.stderr, /No "no such button" control found on the login page/);
+  } finally { site.close(); }
+});
+
+test('closing stdin stops the helper, closes Chrome and removes the profile (the stop signal that works on Windows too)', e2e, async () => {
+  const site = new FakeSbi();
+  await site.listen();
+  try {
+    const run = await runHelper('enroll', { headless: true, loginUrl: `${site.mainOrigin}/enroll`, enrollTimeoutMs: 30_000 }, {
+      onMessage: (message, child) => { if (message.type === 'registered') child.stdin.end(); },
+    });
+    assert.equal(run.code, 143, run.stderr);
+    assert.equal(run.result, undefined, 'a stopped helper reports no result');
+    await assertNoLeftovers('Chrome kept running after its parent went away');
+    let profiles = [];
+    for (let attempt = 0; attempt < 20; attempt++) {
+      profiles = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-'));
+      if (!profiles.length) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    assert.deepEqual(profiles, [], 'the temporary profile was left behind');
+  } finally { site.close(); }
+});
+
+test('a helper that is force-killed leaves its profile, and the next run removes it (no stale session is kept)', e2e, async () => {
+  const site = new FakeSbi();
+  await site.listen();
+  try {
+    const before = new Set(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-')));
+    const killed = await runHelper('enroll', { headless: true, loginUrl: `${site.mainOrigin}/enroll`, enrollTimeoutMs: 30_000 }, {
+      onMessage: (message, child) => { if (message.type === 'registered') child.kill('SIGKILL'); },
+    });
+    assert.equal(killed.result, undefined, 'a killed helper reports nothing');
+    const left = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-') && !before.has(n));
+    assert.equal(left.length, 1, 'the killed helper could not delete its temporary profile');
+    await assertNoLeftovers('Chrome kept running after its helper was killed');
+    const next = await enrollOn(site);
+    assert.equal(next.code, 0, next.stderr);
+    const remaining = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('brisk-passkey-') && !before.has(n));
+    assert.deepEqual(remaining, [], 'the next run must remove the profile the killed helper left');
   } finally { site.close(); }
 });

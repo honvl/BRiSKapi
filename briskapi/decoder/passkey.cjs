@@ -86,7 +86,10 @@ function validateCredential(credential) {
 const MAC_CHROME = ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/Applications/Chromium.app/Contents/MacOS/Chromium'];
 const LINUX_CHROME = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
+// Chrome installs per machine under either Program Files, or per user under LOCALAPPDATA.
+const WINDOWS_CHROME_ROOTS = ['ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'];
 
+// Paths follow the platform being asked about, not the one running, so each branch behaves the same anywhere.
 function findChrome({ env = process.env, platform = process.platform, exists = fs.existsSync } = {}) {
   if (env.BRISK_CHROME) {
     if (!exists(env.BRISK_CHROME)) throw new PasskeyError(`BRISK_CHROME does not exist: ${env.BRISK_CHROME}`);
@@ -94,14 +97,17 @@ function findChrome({ env = process.env, platform = process.platform, exists = f
   }
   let found;
   if (platform === 'darwin') {
-    found = [...MAC_CHROME, path.join(env.HOME || os.homedir(), MAC_CHROME[0].slice(1))].find((p) => exists(p));
+    found = [...MAC_CHROME, path.posix.join(env.HOME || os.homedir(), MAC_CHROME[0].slice(1))].find((p) => exists(p));
   } else if (platform === 'linux') {
     for (const name of LINUX_CHROME) {
-      found = (env.PATH || '').split(path.delimiter).filter(Boolean).map((d) => path.join(d, name)).find((p) => exists(p));
+      found = (env.PATH || '').split(':').filter(Boolean).map((d) => path.posix.join(d, name)).find((p) => exists(p));
       if (found) break;
     }
+  } else if (platform === 'win32') {
+    found = WINDOWS_CHROME_ROOTS.map((name) => env[name]).filter(Boolean)
+      .map((root) => path.win32.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe')).find((p) => exists(p));
   } else {
-    throw new PasskeyError(`Passkey login supports macOS and Linux, not ${platform}`);
+    throw new PasskeyError(`Passkey login supports macOS, Linux and Windows, not ${platform}`);
   }
   if (!found) throw new PasskeyError('Google Chrome (or Chromium) was not found; install it or set BRISK_CHROME to its executable');
   return found;
@@ -192,10 +198,40 @@ class Cdp {
   }
 }
 
+const PROFILE_PREFIX = 'brisk-passkey-';
+const OWNER_FILE = 'brisk-owner.pid';
+
+function processAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+}
+
+// A force-killed helper cannot delete its temporary profile, which holds the broker's logged-in session.
+// Each profile records its owner, so the next start removes the ones whose owner is gone.
+function sweepStaleProfiles({ tmp = os.tmpdir(), now = Date.now(), alive = processAlive } = {}) {
+  let names;
+  try { names = fs.readdirSync(tmp); } catch { return []; }
+  const removed = [];
+  for (const name of names.filter((n) => n.startsWith(PROFILE_PREFIX))) {
+    const dir = path.join(tmp, name);
+    let pid = NaN;
+    try { pid = Number(fs.readFileSync(path.join(dir, OWNER_FILE), 'utf8')); } catch { /* no owner recorded yet */ }
+    if (Number.isInteger(pid) && pid > 0) {
+      if (alive(pid)) continue;
+    } else {
+      // No owner file: a profile still being created by a starting helper. Leave it a minute.
+      try { if (now - fs.statSync(dir).mtimeMs < 60_000) continue; } catch { continue; }
+    }
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 200 }); removed.push(name); } catch { /* locked: next time */ }
+  }
+  return removed;
+}
+
 async function launchChrome({ chrome, profileDir, headless, spawnImpl = spawn }) {
   const ephemeral = !profileDir;
-  const dir = ephemeral ? fs.mkdtempSync(path.join(os.tmpdir(), 'brisk-passkey-')) : profileDir;
+  if (ephemeral) sweepStaleProfiles();
+  const dir = ephemeral ? fs.mkdtempSync(path.join(os.tmpdir(), PROFILE_PREFIX)) : profileDir;
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (ephemeral) fs.writeFileSync(path.join(dir, OWNER_FILE), String(process.pid));
   const args = ['--remote-debugging-pipe', `--user-data-dir=${dir}`, '--no-first-run', '--no-default-browser-check',
     '--disable-sync', '--password-store=basic', '--use-mock-keychain'];
   if (headless) args.push('--headless=new');
@@ -203,7 +239,8 @@ async function launchChrome({ chrome, profileDir, headless, spawnImpl = spawn })
   args.push('about:blank');
   const child = spawnImpl(chrome, args, { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
   const exited = new Promise((resolve) => child.once('exit', resolve));
-  const discard = () => { if (ephemeral) fs.rmSync(dir, { recursive: true, force: true }); };
+  // Windows can keep a file in the profile locked for a moment after Chrome exits, so deleting retries.
+  const discard = () => { if (ephemeral) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }); };
   try {
     await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   } catch (error) {
@@ -437,7 +474,8 @@ async function enroll(request, ctx) {
 
 async function main(argv = process.argv.slice(2), env = {}) {
   const emit = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
-  const finish = (result) => { emit({ type: 'result', ...result }); return result.ok ? 0 : 1; };
+  let finished = false;
+  const finish = (result) => { finished = true; emit({ type: 'result', ...result }); return result.ok ? 0 : 1; };
   if (process.stdout.isTTY || process.stdin.isTTY) {
     process.stderr.write('brisk passkey: run this through `brisk enroll` or `brisk login`; it prints credentials\n');
     return 2;
@@ -447,9 +485,17 @@ async function main(argv = process.argv.slice(2), env = {}) {
   const first = await iterator.next();
   let done = null;
   const doneWait = new Promise((resolve) => { done = resolve; });
-  (async () => { for await (const line of iterator) if (line.trim() === 'done') break; done(); })();
   let cleanup = null;
   const stop = async (code) => { try { if (cleanup) await cleanup(); } finally { process.exit(code); } };
+  // After the request, stdin carries one control word, "done" (enroll: the registration is complete).
+  // stdin closing without it means the parent is gone or is stopping us: close Chrome and exit. This
+  // is the stop signal that works everywhere; Windows has no SIGTERM, only an abrupt TerminateProcess.
+  (async () => {
+    let confirmed = false;
+    for await (const line of iterator) if (line.trim() === 'done') { confirmed = true; break; }
+    if (confirmed) done();
+    else if (!first.done && !finished) stop(143);
+  })();
   process.once('SIGINT', () => stop(130));
   process.once('SIGTERM', () => stop(143));
   const ctx = { emit, launch: env.launch || launchChrome, findChrome: env.findChrome || findChrome, done: doneWait,
@@ -467,7 +513,7 @@ async function main(argv = process.argv.slice(2), env = {}) {
   }
 }
 
-module.exports = { PasskeyError, Cdp, DEFAULTS, AUTHENTICATOR, findChrome, launchChrome, pickCookies, originOf,
+module.exports = { PasskeyError, Cdp, DEFAULTS, AUTHENTICATOR, findChrome, launchChrome, sweepStaleProfiles, pickCookies, originOf,
   resolveOptions, validateCredential, Browser, login, enroll, main };
 
 if (require.main === module) {

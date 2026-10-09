@@ -201,7 +201,9 @@ and verification as done, produces a sign-in the site cannot tell from a phone's
 a credential, which is how the passkey is kept between runs. Two things limit it: the site may detect
 the automated browser by other means, and the passkey is now a secret that sits in software.
 Passless-style virtual USB devices were ruled out: they need `/dev/uhid` (Linux only), and on macOS
-creating a virtual HID device needs an entitlement that Apple grants on request.
+creating a virtual HID device needs an entitlement that Apple grants on request. The Chrome route
+needs neither and runs wherever Chrome and Node do: macOS, Windows and Linux. On Windows it is run from
+Windows itself, using Windows' Chrome, Node and Python; WSL is Linux and would need its own Chrome.
 
 ### The helper
 
@@ -210,9 +212,14 @@ the login URL, button text and cookie host come in the request.
 
 1. **Private pipe, no port.** Chrome is started with `--remote-debugging-pipe` and talked to
    over file descriptors 3 and 4 (NUL-framed JSON). A loopback debugging port would let any
-   local process attach and read the passkey back out with `WebAuthn.getCredentials`.
+   local process attach and read the passkey back out with `WebAuthn.getCredentials`. Windows
+   passes those two descriptors to Chrome too (Chrome has a separate named-pipe switch for
+   Windows, which is not needed): checked with native Node 25.8 and Chrome 154 on Windows 11.
 2. **Ephemeral profile.** The profile is a new private directory, deleted when Chrome exits
-   (`--profile-dir` opts into a persistent one). The mock keychain and basic password store
+   (`--profile-dir` opts into a persistent one). It holds the broker's logged-in session, so a helper
+   that is force-killed (which cannot clean up after itself) must not leave it around: each profile
+   records its owner's process id, and every start removes `brisk-passkey-*` profiles whose owner is
+   gone, leaving live and just-created ones alone. The mock keychain and basic password store
    keep Chrome from prompting for Keychain access. Chrome reports `navigator.webdriver` as
    true whenever DevTools is attached (checked in both modes), and headless Chrome's user
    agent says so too, so a site that blocks automated browsers can tell. The host does not
@@ -249,15 +256,29 @@ Secrets move only over stdin and stdout, never on a command line or in a log mes
 name origins, never paths or queries, and the helper refuses to run attached to a terminal).
 The saved login is kept in the macOS Keychain through `security -i`, which reads its command from
 stdin: `add-generic-password -w SECRET` would show the secret in the process list. `security`
-exits 0 even when a write fails, so each write is read back and compared. Without a Keychain
-(not macOS) it is stored only if `BRISK_PASSKEY_STORE=file` asks for an owner-only
-file, which is weaker. The private key is the whole credential: whoever has it can sign in.
+exits 0 even when a write fails, so each write is read back and compared. On Windows it is one
+Credential Manager entry for this user on this machine (`CredWriteW` and friends through `ctypes`, no
+extra dependency; an entry holds at most 2,560 bytes, which a passkey fits in), also read back after
+each write. Elsewhere it is stored only if `BRISK_PASSKEY_STORE=file` asks for an owner-only
+file, which is weaker (and on Windows a file's privacy comes from its folder's ACL, since `0600` means
+nothing there). The private key is the whole credential: whoever has it can sign in.
+
+Three things differ on Windows, and the code and tests cover each. A process cannot be signalled to stop
+there (terminating one kills it outright, which would leave Chrome and its profile behind), so the
+helper treats a closed stdin as the request to close Chrome and exit, on every platform; the Python side
+closes it first and terminates only if the helper does not exit within `GRACE` (20) seconds, which is
+longer than closing Chrome and deleting its profile can take. (Killing the helper outright does make
+Chrome exit on its own within about a second on Windows, because its pipe closes.) Text between
+Python and Node is always UTF-8, because Python's default there is the system code page (cp1252) and a
+Japanese user name or button text would fail to decode. And deleting the temporary profile retries,
+because Windows can keep a file locked for a moment after Chrome exits.
 
 Tests run Chrome against a fake broker (`tools/brisk_mock/fake_sbi_passkey.cjs`) that verifies
 what a real site verifies: the ES256 signature, the relying-party hash, user presence and
 verification, and a counter that must increase. They cover enroll, sign-in, a stale passkey
 being refused as a clone, `launch_url`, a missing passkey control, delivery to a data client and to a
-file, and that nothing secret is logged. They skip when Chrome is absent.
+file, and that nothing secret is logged. They skip when Chrome is absent. They were run on macOS, on native Windows 11 (Windows' own Node,
+Python and Chrome; the full suite including the real Credential Manager) and, in CI, on Linux.
 
 What is not verified against any real broker: each site's login URL (SBI's redirected to a
 maintenance page when checked, SMBC Nikko's and Monex's refuse a bare request), the passkey control's
@@ -265,8 +286,9 @@ text, how BRiSK is launched from the main site, the name of the BRiSK session co
 known, so the other sites accept any cookie on their BRiSK host once it appears), whether a broker
 accepts a virtual authenticator at registration or asks for more identity checks, whether it refuses
 an automated Chrome (see above), and how long the cookie lasts. Each is an overridable default or a
-manual step, and a wrong guess ends in an explicit error. The DevTools `WebAuthn` domain is marked
-experimental. Windows is not supported.
+manual step, and a wrong guess ends in an explicit error. The visible Chrome window of `enroll` and
+`login` was tried on macOS only; the Windows runs were headless. The DevTools `WebAuthn` domain is
+marked experimental.
 
 ## Reconstructing a recording
 

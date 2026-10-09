@@ -89,12 +89,14 @@ from your own browser. They are credentials:
   SMBC Nikko or one you add) capture a passkey that you register at that broker and use it to
   obtain BRiSK session cookies. The passkey's private key is a credential that lets whoever
   has it sign in to your brokerage account. It is kept, together with the name of the broker, only
-  in the macOS Keychain (or, if you set `BRISK_PASSKEY_STORE=file`, in an owner-only file under
-  `~/.config/brisk/`), is passed to the sign-in helper over stdin and never on a command line,
+  in the macOS Keychain or Windows Credential Manager (or, if you set `BRISK_PASSKEY_STORE=file`, in
+  an owner-only file under `~/.config/brisk/`, which on Windows is protected by your user profile
+  folder), is passed to the sign-in helper over stdin and never on a command line,
   and is never logged, uploaded or included in any recording. `brisk forget` deletes it here;
   remove it at the broker as well. Cookies of a broker without a data client are kept in an
   owner-only file under `~/.config/brisk/cookies/`. The Chrome profile used for sign-in is
-  temporary and deleted afterwards, and only the BRiSK host's cookies are taken from it.
+  temporary and deleted afterwards (one left by a force-killed run is removed at the next start),
+  and only the BRiSK host's cookies are taken from it.
 - SBI market data is published only after an explicit opt-in at the start of that
   capture (Enter accepts the interactive question), `--share-market-data`, or
   `sbi.connect(share_market_data=True)`, together with current contribution consent.

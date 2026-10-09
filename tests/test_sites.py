@@ -14,7 +14,7 @@ def isolated(tmp_path, monkeypatch):
 
 def write(tmp_path, document):
     path = tmp_path / 'sites.json'
-    path.write_text(document if isinstance(document, str) else json.dumps(document))
+    path.write_text(document if isinstance(document, str) else json.dumps(document, ensure_ascii=False), encoding='utf-8')
     return path
 
 
@@ -48,6 +48,12 @@ def test_a_new_site_needs_a_login_url_and_a_cookie_host(tmp_path):
         sites.load_sites(write(tmp_path, {'sites': [{'id': 'bare'}]}))
     with pytest.raises(sites.SiteError, match='a new site needs cookie_host'):
         sites.load_sites(write(tmp_path, {'sites': [{'id': 'bare', 'login_url': 'https://x.example/'}]}))
+
+
+def test_a_sites_file_with_japanese_text_is_read_as_utf_8(tmp_path):
+    path = write(tmp_path, {'sites': [{'id': 'matsui', 'passkey_button': 'パスキーで安全にログイン'}]})
+    assert 'パスキーで安全にログイン' in path.read_bytes().decode('utf-8'), 'the fixture must hold real UTF-8, not escapes'
+    assert sites.load_sites(path)['matsui'].passkey_button == 'パスキーで安全にログイン'
 
 
 def test_a_built_in_site_is_edited_by_giving_only_the_keys_that_change(tmp_path):

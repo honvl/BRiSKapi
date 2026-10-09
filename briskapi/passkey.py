@@ -26,9 +26,9 @@ the device and signs without asking. So:
     then reads the BRiSK session cookies (only those of the BRiSK host), saves them and closes.
 
 The saved login is the broker you chose plus the passkey. That passkey's private key IS the credential:
-whoever has it can sign in to your account with no further check, so it is kept in the macOS Keychain (or,
-only if you set BRISK_PASSKEY_STORE=file, an owner-only file) and is never put on a command line, in a
-log or in the repository. A passkey also carries a sign counter that a broker may check, so every change is
+whoever has it can sign in to your account with no further check, so it is kept in the macOS Keychain or
+Windows Credential Manager (or, only if you set BRISK_PASSKEY_STORE=file, an owner-only file) and is never
+put on a command line, in a log or in the repository. A passkey also carries a sign counter that a broker may check, so every change is
 saved the moment it happens. Chrome runs under Node over a private pipe (briskapi/decoder/passkey.cjs)
 with a temporary profile that is deleted afterwards. Chrome tells the site it is being automated, so a
 broker may refuse it. See ARCHITECTURE.md for the details.
@@ -52,6 +52,7 @@ HELPER = Path(__file__).resolve().parent / 'decoder' / 'passkey.cjs'
 SERVICE = 'briskapi-brisk-passkey'
 ACCOUNT = 'default'
 SECURITY = '/usr/bin/security'
+GRACE = 20.0  # seconds a helper gets to close Chrome, delete its profile and exit after its stdin is closed, before it is terminated
 _NAME = re.compile(r'[A-Za-z0-9._-]+')
 
 
@@ -76,13 +77,13 @@ class FileStore:
         self.description = str(self.path)
 
     def load(self):
-        return json.loads(self.path.read_text()) if self.path.exists() else None
+        return json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else None
 
     def save(self, record):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = self.path.with_name(self.path.name + '.tmp')
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(record, f)
         os.replace(temporary, self.path)
 
@@ -107,7 +108,7 @@ class KeychainStore:
 
     def load(self):
         done = subprocess.run([self.security, 'find-generic-password', '-s', self.service, '-a', self.account, '-w'],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, encoding='utf-8')
         if done.returncode == 44:  # errSecItemNotFound
             return None
         if done.returncode != 0:
@@ -119,7 +120,7 @@ class KeychainStore:
 
     def save(self, record):
         secret = base64.b64encode(json.dumps(record).encode()).decode()
-        done = subprocess.run([self.security, '-i'], capture_output=True, text=True,
+        done = subprocess.run([self.security, '-i'], capture_output=True, text=True, encoding='utf-8',
                               input=f'add-generic-password -U -s {self.service} -a {self.account} -w {secret}\n')
         # `security -i` exits 0 even when the command fails, so the write is checked by reading it back.
         if self.load() != record:
@@ -131,12 +132,125 @@ class KeychainStore:
                        capture_output=True, text=True)
 
 
+class _CredentialManager:
+    """The few advapi32 calls Credential Manager needs, through ctypes (Windows only, no extra dependency)."""
+    CRED_TYPE_GENERIC = 1
+    CRED_PERSIST_LOCAL_MACHINE = 2  # this user on this machine; never roams
+    ERROR_NOT_FOUND = 1168
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes = ctypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [('dwLowDateTime', wintypes.DWORD), ('dwHighDateTime', wintypes.DWORD)]
+
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [('Flags', wintypes.DWORD), ('Type', wintypes.DWORD), ('TargetName', wintypes.LPWSTR),
+                        ('Comment', wintypes.LPWSTR), ('LastWritten', FILETIME), ('CredentialBlobSize', wintypes.DWORD),
+                        ('CredentialBlob', ctypes.POINTER(ctypes.c_ubyte)), ('Persist', wintypes.DWORD),
+                        ('AttributeCount', wintypes.DWORD), ('Attributes', ctypes.c_void_p),
+                        ('TargetAlias', wintypes.LPWSTR), ('UserName', wintypes.LPWSTR)]
+
+        self.CREDENTIAL = CREDENTIAL
+        self.dll = dll = ctypes.WinDLL('advapi32', use_last_error=True)
+        dll.CredWriteW.argtypes, dll.CredWriteW.restype = [ctypes.POINTER(CREDENTIAL), wintypes.DWORD], wintypes.BOOL
+        dll.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.POINTER(CREDENTIAL))]
+        dll.CredReadW.restype = wintypes.BOOL
+        dll.CredDeleteW.argtypes, dll.CredDeleteW.restype = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD], wintypes.BOOL
+        dll.CredFree.argtypes, dll.CredFree.restype = [ctypes.c_void_p], None
+
+    def write(self, target, user, blob):
+        ctypes = self.ctypes
+        buffer = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+        credential = self.CREDENTIAL(Type=self.CRED_TYPE_GENERIC, TargetName=target, UserName=user, CredentialBlobSize=len(blob),
+                                     CredentialBlob=ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)),
+                                     Persist=self.CRED_PERSIST_LOCAL_MACHINE)
+        if not self.dll.CredWriteW(ctypes.byref(credential), 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def read(self, target):
+        ctypes = self.ctypes
+        pointer = ctypes.POINTER(self.CREDENTIAL)()
+        if not self.dll.CredReadW(target, self.CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)):
+            error = ctypes.get_last_error()
+            if error == self.ERROR_NOT_FOUND:
+                return None
+            raise ctypes.WinError(error)
+        try:
+            return ctypes.string_at(pointer.contents.CredentialBlob, pointer.contents.CredentialBlobSize)
+        finally:
+            self.dll.CredFree(pointer)
+
+    def delete(self, target):
+        ctypes = self.ctypes
+        if not self.dll.CredDeleteW(target, self.CRED_TYPE_GENERIC, 0):
+            error = ctypes.get_last_error()
+            if error != self.ERROR_NOT_FOUND:
+                raise ctypes.WinError(error)
+
+
+def _code(error):
+    return getattr(error, 'winerror', None) or error.errno
+
+
+class CredentialManagerStore:
+    """The saved login in Windows Credential Manager (this user, this machine), through advapi32."""
+    MAX_BLOB = 5 * 512  # CRED_MAX_CREDENTIAL_BLOB_SIZE
+
+    def __init__(self, target=SERVICE, user=ACCOUNT, api=None):
+        for name in (target, user):
+            if not _NAME.fullmatch(name):
+                raise PasskeyError('Credential names may only use letters, digits, dots, dashes and underscores')
+        self.target, self.user, self.api = target, user, api
+        self.description = f'Windows Credential Manager entry {target}'
+
+    def _api(self):
+        if self.api is None:
+            self.api = _CredentialManager()
+        return self.api
+
+    def load(self):
+        try:
+            blob = self._api().read(self.target)
+        except OSError as error:
+            raise PasskeyError(f'Could not read the passkey from Credential Manager (error {_code(error)})') from error
+        if blob is None:
+            return None
+        try:
+            return json.loads(blob.decode('utf-8'))
+        except ValueError as error:
+            raise PasskeyError('The Credential Manager entry is not a passkey saved by briskapi') from error
+
+    def save(self, record):
+        blob = json.dumps(record).encode('utf-8')
+        if len(blob) > self.MAX_BLOB:
+            raise PasskeyError(f'The passkey ({len(blob)} bytes) is too large for one Credential Manager entry ({self.MAX_BLOB})')
+        try:
+            self._api().write(self.target, self.user, blob)
+        except OSError as error:
+            raise PasskeyError(f'Could not save the passkey to Credential Manager (error {_code(error)})') from error
+        if self.load() != record:
+            raise PasskeyError('Could not save the passkey to Credential Manager')
+
+    def delete(self):
+        try:
+            self._api().delete(self.target)
+        except OSError as error:
+            raise PasskeyError(f'Could not delete the passkey from Credential Manager (error {_code(error)})') from error
+
+
 def default_store():
-    kind = os.environ.get('BRISK_PASSKEY_STORE') or ('keychain' if sys.platform == 'darwin' else '')
+    kind = os.environ.get('BRISK_PASSKEY_STORE') or {'darwin': 'keychain', 'win32': 'wincred'}.get(sys.platform, '')
     if kind == 'keychain':
         if sys.platform != 'darwin':
             raise PasskeyError('The Keychain store needs macOS')
         return KeychainStore()
+    if kind == 'wincred':
+        if sys.platform != 'win32':
+            raise PasskeyError('The Credential Manager store needs Windows')
+        return CredentialManagerStore()
     if kind == 'file':
         return FileStore()
     raise PasskeyError('There is no secure place for the passkey on this system. Set BRISK_PASSKEY_STORE=file to keep it '
@@ -173,11 +287,29 @@ def _send(proc, text):
         pass  # The helper already stopped; its exit is reported below.
 
 
+def _stop(proc):
+    """Stop the helper. Closing its stdin makes it close Chrome and exit; a signal would not do on Windows, where
+    terminating a process kills it outright and would leave Chrome and its temporary profile behind."""
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        proc.wait(GRACE)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def _run(mode, request, node, on_credential, on_registered=None):
     """Run the helper; its progress goes to our stderr, its credentials and result come back as JSON lines."""
     from briskapi import cli
     cli.check_node(node)
-    proc = subprocess.Popen([node, str(HELPER), mode], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    # The helper speaks UTF-8 (a passkey's user name may be Japanese); on Windows the default would be the code page.
+    proc = subprocess.Popen([node, str(HELPER), mode], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding='utf-8')
     result = None
     try:
         _send(proc, json.dumps({'mode': mode, **request}) + '\n')
@@ -197,11 +329,7 @@ def _run(mode, request, node, on_credential, on_registered=None):
         code = proc.wait()
     finally:
         if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            _stop(proc)
     if result is None:
         raise PasskeyError(f'The passkey helper stopped unexpectedly (exit {code})')
     if not result.get('ok'):
@@ -249,7 +377,7 @@ def _deliver(site, cookies, remember):
         path = cookies_path(site.id)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(cookies, f)
     return SignIn(site, cookies, None, path)
 

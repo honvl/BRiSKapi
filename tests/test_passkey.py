@@ -16,6 +16,14 @@ import briskapi.cli as cli
 from briskapi import passkey, sbi, sites
 
 REPO = Path(__file__).resolve().parent.parent
+posix_only = pytest.mark.skipif(os.name != 'posix', reason='uses a POSIX shell script or POSIX file modes')
+windows_only = pytest.mark.skipif(sys.platform != 'win32', reason='needs Windows')
+
+
+def assert_private(path, mode):
+    """Owner-only modes exist on POSIX; on Windows a file's privacy comes from its folder's ACL."""
+    if os.name == 'posix':
+        assert stat.S_IMODE(path.stat().st_mode) == mode
 PASSKEY = {'credentialId': 'Y3JlZA==', 'isResidentCredential': True, 'rpId': 'sbisec.co.jp', 'privateKey': 'PRIVATE-KEY-MATERIAL',
            'userHandle': 'AQID', 'signCount': 4, 'userName': 'trader'}
 RECORD = {'site': 'sbi', 'credential': PASSKEY}
@@ -35,8 +43,8 @@ def test_file_store_keeps_the_saved_login_in_an_owner_only_file(tmp_path):
     assert store.load() is None
     store.save(RECORD)
     assert store.load() == RECORD
-    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
+    assert_private(store.path, 0o600)
+    assert_private(store.path.parent, 0o700)
     store.save({**RECORD, 'site': 'matsui'})
     assert store.load()['site'] == 'matsui'
     assert [p.name for p in store.path.parent.iterdir()] == ['passkey.json']  # no temporary file left behind
@@ -72,23 +80,25 @@ def keychain(tmp_path, monkeypatch):
     return passkey.KeychainStore(security=str(script)), tmp_path / 'kc'
 
 
+@posix_only
 def test_keychain_store_never_puts_the_passkey_on_a_command_line(keychain):
     store, kc = keychain
     assert store.load() is None
     store.save(RECORD)
     assert store.load() == RECORD
-    argv = (kc / 'argv').read_text()
+    argv = (kc / 'argv').read_text(encoding='utf-8')
     assert 'PRIVATE-KEY-MATERIAL' not in argv
     assert 'add-generic-password' not in argv, 'a write on the command line would show the secret to other users'
     assert '-i' in argv.splitlines()
     assert all(line.startswith(('-i', 'find-generic-password')) for line in argv.splitlines())
-    written = (kc / 'stdin').read_text()
+    written = (kc / 'stdin').read_text(encoding='utf-8')
     assert written.startswith('add-generic-password -U -s briskapi-brisk-passkey -a default -w ')
     assert 'PRIVATE-KEY-MATERIAL' not in written  # base64 of the JSON, not the text itself
     store.delete()
     assert store.load() is None
 
 
+@posix_only
 def test_keychain_store_checks_that_the_write_really_happened(keychain, monkeypatch):
     store, _ = keychain
     monkeypatch.setenv('FAKE_SECURITY_FAIL', '1')
@@ -101,6 +111,7 @@ def test_keychain_store_checks_that_the_write_really_happened(keychain, monkeypa
         store.load()
 
 
+@posix_only
 def test_keychain_store_rejects_foreign_items_and_unsafe_names(keychain):
     store, kc = keychain
     (kc / 'item').write_text('not base64 json!')
@@ -116,6 +127,8 @@ def test_keychain_store_rejects_foreign_items_and_unsafe_names(keychain):
 def test_default_store_follows_the_platform_and_the_environment(monkeypatch):
     monkeypatch.setattr(passkey.sys, 'platform', 'darwin')
     assert isinstance(passkey.default_store(), passkey.KeychainStore)
+    monkeypatch.setattr(passkey.sys, 'platform', 'win32')
+    assert isinstance(passkey.default_store(), passkey.CredentialManagerStore)
     monkeypatch.setattr(passkey.sys, 'platform', 'linux')
     with pytest.raises(passkey.PasskeyError, match='BRISK_PASSKEY_STORE=file'):
         passkey.default_store()
@@ -124,6 +137,90 @@ def test_default_store_follows_the_platform_and_the_environment(monkeypatch):
     monkeypatch.setenv('BRISK_PASSKEY_STORE', 'keychain')
     with pytest.raises(passkey.PasskeyError, match='needs macOS'):
         passkey.default_store()
+    monkeypatch.setenv('BRISK_PASSKEY_STORE', 'wincred')
+    with pytest.raises(passkey.PasskeyError, match='needs Windows'):
+        passkey.default_store()
+
+
+class FakeCredApi:
+    """Credential Manager's three calls, in memory, raising the errors the real ones would."""
+
+    def __init__(self):
+        self.items, self.fail, self.drop_writes = {}, {}, False
+
+    def write(self, target, user, blob):
+        if 'write' in self.fail:
+            raise OSError(self.fail['write'], 'write failed')
+        if not self.drop_writes:
+            self.items[target] = (user, blob)
+
+    def read(self, target):
+        if 'read' in self.fail:
+            raise OSError(self.fail['read'], 'read failed')
+        return self.items[target][1] if target in self.items else None
+
+    def delete(self, target):
+        if 'delete' in self.fail:
+            raise OSError(self.fail['delete'], 'delete failed')
+        self.items.pop(target, None)
+
+
+def test_credential_manager_store_keeps_the_saved_login_as_one_entry():
+    api = FakeCredApi()
+    store = passkey.CredentialManagerStore(api=api)
+    assert store.load() is None and store.description == 'Windows Credential Manager entry briskapi-brisk-passkey'
+    store.save(RECORD)
+    assert store.load() == RECORD
+    user, blob = api.items['briskapi-brisk-passkey']
+    assert user == 'default' and json.loads(blob) == RECORD
+    store.save({**RECORD, 'site': 'monex'})
+    assert store.load()['site'] == 'monex' and len(api.items) == 1
+    store.delete()
+    store.delete()
+    assert store.load() is None
+
+
+def test_credential_manager_store_reports_failures_with_the_error_code():
+    api = FakeCredApi()
+    store = passkey.CredentialManagerStore(api=api)
+    api.fail = {'write': 5}
+    with pytest.raises(passkey.PasskeyError, match=r'Could not save the passkey to Credential Manager \(error 5\)'):
+        store.save(RECORD)
+    api.fail = {'read': 1312}
+    with pytest.raises(passkey.PasskeyError, match=r'Could not read the passkey from Credential Manager \(error 1312\)'):
+        store.load()
+    api.fail = {'delete': 5}
+    with pytest.raises(passkey.PasskeyError, match=r'Could not delete the passkey from Credential Manager \(error 5\)'):
+        store.delete()
+    api.fail = {}
+    api.drop_writes = True
+    with pytest.raises(passkey.PasskeyError, match=r'^Could not save the passkey to Credential Manager$'):
+        store.save(RECORD)
+    big = {'site': 'sbi', 'credential': {**PASSKEY, 'privateKey': 'x' * 3000}}
+    with pytest.raises(passkey.PasskeyError, match=r'too large for one Credential Manager entry \(2560\)'):
+        passkey.CredentialManagerStore(api=FakeCredApi()).save(big)
+    api.drop_writes = False
+    api.items['briskapi-brisk-passkey'] = ('default', b'not json')
+    with pytest.raises(passkey.PasskeyError, match='not a passkey saved by briskapi'):
+        store.load()
+    for name in ('a b', 'x;y', ''):
+        with pytest.raises(passkey.PasskeyError, match='may only use letters'):
+            passkey.CredentialManagerStore(target=name)
+
+
+@windows_only
+def test_credential_manager_for_real():
+    store = passkey.CredentialManagerStore(target=f'briskapi-test-{os.getpid()}')
+    try:
+        assert store.load() is None
+        store.save(RECORD)
+        assert store.load() == RECORD
+        store.save({**RECORD, 'site': 'monex'})
+        assert store.load()['site'] == 'monex'
+    finally:
+        store.delete()
+    assert store.load() is None
+    store.delete()
 
 
 # ---- the helper protocol, against a scripted helper ----
@@ -142,10 +239,12 @@ rl.on('line', (line) => {
     fs.writeFileSync(process.env.FAKE_LOG, JSON.stringify({ argv: process.argv.slice(2), request, pid: process.pid }));
     const credential = request.credential && { ...request.credential, signCount: request.credential.signCount + 1 };
     if (scenario === 'login-ok') { out({ type: 'credential', credential }); out({ type: 'result', ok: true, cookies: { session_x: 'cookie-value', other: 'o' } }); }
+    else if (scenario === 'japanese') { out({ type: 'credential', credential: { ...credential, userName: '取引 太郎' } }); out({ type: 'result', ok: true, cookies: { session_x: 'v' } }); }
     else if (scenario === 'noise') { console.log('some stray output'); out({ type: 'credential', credential }); out({ type: 'result', ok: true, cookies: { session_x: 'v' } }); }
     else if (scenario === 'login-refused') { out({ type: 'credential', credential }); out({ type: 'result', ok: false, error: 'The login was refused' }); }
     else if (scenario === 'crash') { out({ type: 'credential', credential }); process.exit(3); }
     else if (scenario === 'hang') { out({ type: 'credential', credential }); setInterval(() => {}, 1000); }
+    else if (scenario === 'eof-aware') { out({ type: 'credential', credential }); rl.on('close', () => { fs.writeFileSync(process.env.FAKE_LOG + '.eof', 'eof'); process.exit(0); }); setInterval(() => {}, 1000); }
     else if (scenario === 'enroll-ok') { out({ type: 'credential', credential: fresh }); out({ type: 'registered' }); }
     else if (scenario === 'enroll-refused') { out({ type: 'credential', credential: fresh }); out({ type: 'result', ok: false, error: 'No registration happened' }); }
     else if (scenario === 'enroll-empty') { out({ type: 'result', ok: true }); }
@@ -162,8 +261,9 @@ rl.on('line', (line) => {
 @pytest.fixture
 def helper(tmp_path, monkeypatch):
     script = tmp_path / 'fake_passkey.cjs'
-    script.write_text(FAKE_HELPER)
+    script.write_text(FAKE_HELPER, encoding='utf-8')
     monkeypatch.setattr(passkey, 'HELPER', script)
+    monkeypatch.setattr(passkey, 'GRACE', 0.5)  # the scripted helpers either exit on EOF or are terminated after this
     log = tmp_path / 'helper.json'
     monkeypatch.setenv('FAKE_LOG', str(log))
 
@@ -179,11 +279,20 @@ def saved(tmp_path, record=RECORD):
     return store
 
 
+def alive(pid):
+    if sys.platform == 'win32':  # os.kill(pid, 0) would terminate the process there
+        listing = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH', '/FO', 'CSV'], capture_output=True, text=True).stdout
+        return f'"{pid}"' in listing
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def wait_gone(pid):
     for _ in range(50):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not alive(pid):
             return
         time.sleep(0.1)
     os.kill(pid, 9)
@@ -198,26 +307,26 @@ def test_login_signs_in_saves_the_advanced_passkey_and_uses_the_cookies(tmp_path
     assert store.load() == {'site': 'sbi', 'credential': {**PASSKEY, 'signCount': 5}}, 'the sign counter must be saved'
     assert signin.site.id == 'sbi' and signin.cookies == {'session_x': 'cookie-value', 'other': 'o'}
     assert signin.client.session.cookies == signin.cookies and sbi._default() is signin.client
-    seen = json.loads(log.read_text())
+    seen = json.loads(log.read_text(encoding='utf-8'))
     assert seen['argv'] == ['login'], 'nothing but the mode may be on the command line'
     request = seen['request']
     assert request['credential'] == PASSKEY and request['mode'] == 'login'
     assert {k: request[k] for k in ('loginUrl', 'launchUrl', 'passkeyButton', 'headless', 'chrome', 'profileDir', 'cookieHost',
                                     'cookiePrefix')} == {
         'loginUrl': 'https://x.example/login', 'launchUrl': 'https://x.example/brisk', 'passkeyButton': 'Passkey',
-        'headless': True, 'chrome': '/opt/chrome', 'profileDir': str(tmp_path / 'profile'), 'cookieHost': 'sbi.brisk.jp',
+        'headless': True, 'chrome': str(Path('/opt/chrome')), 'profileDir': str(tmp_path / 'profile'), 'cookieHost': 'sbi.brisk.jp',
         'cookiePrefix': 'session_'}
     cookie_file = tmp_path / 'config' / 'brisk' / 'sbi-cookies.json'
     assert signin.saved_to == cookie_file
-    assert json.loads(cookie_file.read_text()) == signin.cookies
-    assert stat.S_IMODE(cookie_file.stat().st_mode) == 0o600
+    assert json.loads(cookie_file.read_text(encoding='utf-8')) == signin.cookies
+    assert_private(cookie_file, 0o600)
 
 
 def test_the_site_supplies_the_defaults_and_the_chosen_site_is_remembered(tmp_path, helper):
     log = helper('login-ok')
     store = saved(tmp_path, {'site': 'matsui', 'credential': PASSKEY})
     passkey.login(store=store, remember=False)
-    request = json.loads(log.read_text())['request']
+    request = json.loads(log.read_text(encoding='utf-8'))['request']
     matsui = sites.BUILTIN['matsui']
     assert (request['loginUrl'], request['cookieHost'], request['passkeyButton'], request['cookiePrefix']) == (
         matsui.login_url, 'matsui.brisk.jp', 'パスキーでログイン', '')
@@ -231,8 +340,9 @@ def test_a_site_without_a_data_client_keeps_its_cookies_in_a_file_and_leaves_the
     signin = passkey.login(store=store)
     assert signin.site.id == 'monex' and signin.client is None and sbi._client is None
     file = tmp_path / 'config' / 'brisk' / 'cookies' / 'monex.json'
-    assert signin.saved_to == file and json.loads(file.read_text()) == {'session_x': 'cookie-value', 'other': 'o'}
-    assert stat.S_IMODE(file.stat().st_mode) == 0o600 and stat.S_IMODE(file.parent.stat().st_mode) == 0o700
+    assert signin.saved_to == file and json.loads(file.read_text(encoding='utf-8')) == {'session_x': 'cookie-value', 'other': 'o'}
+    assert_private(file, 0o600)
+    assert_private(file.parent, 0o700)
     assert not (tmp_path / 'config' / 'brisk' / 'sbi-cookies.json').exists()
     assert passkey.login(store=store, remember=False).saved_to is None
 
@@ -255,6 +365,14 @@ def test_cookies_of_another_site_are_never_given_to_the_sbi_client(tmp_path, hel
     assert not log.exists(), 'the refusal must come before Chrome is started'
     assert store.load() == RECORD, 'no sign-in happened, so the counter is unchanged'
     assert sbi._client is None
+
+
+def test_non_ascii_text_from_the_helper_is_read_as_utf_8_whatever_the_system_code_page(tmp_path, helper):
+    # Node writes UTF-8; Python on Windows would otherwise read it as cp1252 and fail on bytes such as 0x81.
+    helper('japanese')
+    store = saved(tmp_path)
+    passkey.login(store=store, remember=False)
+    assert store.load()['credential']['userName'] == '取引 太郎'
 
 
 def test_stray_helper_output_is_ignored(tmp_path, helper):
@@ -294,7 +412,23 @@ def test_if_the_passkey_cannot_be_saved_the_helper_is_stopped(helper):
 
     with pytest.raises(passkey.PasskeyError, match='Keychain is locked'):
         passkey.login(store=Broken())
-    wait_gone(json.loads(log.read_text())['pid'])
+    wait_gone(json.loads(log.read_text(encoding='utf-8'))['pid'])
+
+
+def test_a_helper_that_understands_a_closed_stdin_is_stopped_gracefully(helper):
+    log = helper('eof-aware')
+
+    class Broken:
+        def load(self):
+            return RECORD
+
+        def save(self, record):
+            raise passkey.PasskeyError('Keychain is locked')
+
+    with pytest.raises(passkey.PasskeyError, match='Keychain is locked'):
+        passkey.login(store=Broken())
+    assert Path(str(log) + '.eof').exists(), 'the helper must be asked to stop by closing its stdin, so it can close Chrome'
+    wait_gone(json.loads(log.read_text(encoding='utf-8'))['pid'])
 
 
 def test_login_needs_a_usable_saved_login_and_node(tmp_path, helper):
@@ -322,10 +456,10 @@ def test_enroll_saves_the_chosen_site_with_the_final_passkey_after_the_user_conf
     assert record['site'] == 'matsui' and record['credential']['signCount'] == 2 and record['credential']['privateKey'] == 'PRIV-NEW'
     assert summary == {'site': 'matsui', 'rp_id': 'sbisec.co.jp', 'user_name': 'trader', 'stored_in': str(store.path)}
     assert 'PRIV' not in json.dumps(summary)
-    seen = json.loads(log.read_text())
+    seen = json.loads(log.read_text(encoding='utf-8'))
     assert seen['argv'] == ['enroll'] and seen['request']['loginUrl'] == sites.BUILTIN['matsui'].login_url
     passkey.enroll(site='sbi', store=store, confirm=lambda: None, replace=True, login_url='https://x.example/start')
-    assert json.loads(log.read_text())['request']['loginUrl'] == 'https://x.example/start'
+    assert json.loads(log.read_text(encoding='utf-8'))['request']['loginUrl'] == 'https://x.example/start'
 
 
 def test_enroll_asks_which_broker_when_no_site_is_given(tmp_path, helper):
@@ -377,7 +511,7 @@ def test_enroll_waits_for_a_person_and_stops_chrome_when_there_is_none(tmp_path,
     with pytest.raises(passkey.PasskeyError, match='needs an interactive terminal'):
         passkey.enroll(site='sbi', store=store)
     assert store.load() is None
-    wait_gone(json.loads(log.read_text())['pid'])
+    wait_gone(json.loads(log.read_text(encoding='utf-8'))['pid'])
 
 
 def test_confirm_prompts_on_stderr_and_waits_for_enter(monkeypatch, capsys):
@@ -430,7 +564,7 @@ def test_cli_enroll_login_and_forget(monkeypatch, capsys):
     assert calls[-1] == ('login', {'remember': True, 'login_url': None, 'launch_url': None, 'passkey_button': None, 'chrome': None,
                                    'profile_dir': None, 'headless': False})
     err = capsys.readouterr().err
-    assert 'Signed in to SBI Securities; session cookies saved to /c/sbi-cookies.json.' in err and 'no data client' not in err
+    assert f'Signed in to SBI Securities; session cookies saved to {Path("/c/sbi-cookies.json")}.' in err and 'no data client' not in err
     cli.main(['login', '--no-remember', '--headless', '--launch-url', 'https://b/', '--passkey-button', 'Passkey'])
     assert calls[-1][1]['remember'] is False and calls[-1][1]['headless'] is True and calls[-1][1]['launch_url'] == 'https://b/'
     err = capsys.readouterr().err
@@ -480,7 +614,8 @@ class FakeBroker:
         self.process.wait(timeout=15)
 
     def state(self):
-        with urllib.request.urlopen(self.origins['mainOrigin'] + '/__state', timeout=10) as response:
+        # Chrome resolves *.localhost itself; Python's resolver on Windows does not, so ask the loopback address.
+        with urllib.request.urlopen(self.origins['mainOrigin'].replace('main.localhost', '127.0.0.1') + '/__state', timeout=10) as response:
             return json.load(response)
 
     def registered(self):
@@ -513,7 +648,7 @@ def test_full_stack_a_site_you_define_enroll_then_login(tmp_path):
         seen = broker.state()
         assert signin.site.id == 'fake' and signin.client is None and sbi._client is None
         assert signin.cookies['session_fake'] == seen['briskCookieValue'] and 'main_session' not in signin.cookies
-        assert json.loads(signin.saved_to.read_text()) == signin.cookies and signin.saved_to.name == 'fake.json'
+        assert json.loads(signin.saved_to.read_text(encoding='utf-8')) == signin.cookies and signin.saved_to.name == 'fake.json'
         assert seen['accepted'] == 1
         assert store.load()['credential']['signCount'] > enrolled['signCount']
         assert store.load()['credential']['signCount'] == seen['counter'], 'the saved counter must be the one the site last saw'

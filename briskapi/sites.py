@@ -10,7 +10,8 @@ host the BRiSK session cookies belong to. Four are built in, taken from the brok
     smbcnikko  SMBC Nikko Securities
 
 None has been checked against a live account, so each detail can be overridden, and you can add your
-own entries (or correct a built-in one) in ~/.config/brisk/sites.json:
+own entries (or correct a built-in one) in ~/.config/brisk/sites.json (C:\\Users\\you\\.config\\brisk\\sites.json
+on Windows; XDG_CONFIG_HOME overrides the folder):
 
     {"sites": [{"id": "mybroker", "name": "My Broker", "login_url": "https://broker.example/login",
                 "cookie_host": "mybroker.brisk.jp", "passkey_button": "Sign in with a passkey"}]}
@@ -110,7 +111,7 @@ def load_sites(path=None) -> dict:
     if not path.exists():
         return sites
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding='utf-8'))  # button texts are Japanese; never the system code page
     except ValueError as error:
         raise SiteError(f'{path} is not valid JSON ({error})') from error
     entries = raw.get('sites') if isinstance(raw, dict) else None

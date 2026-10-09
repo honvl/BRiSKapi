@@ -131,7 +131,9 @@ on, a timing summary is shared even when market-data sharing is declined.
 Many brokers now have you sign in with a passkey. If yours does, `briskapi` can do the
 sign-in for you and keep the BRiSK session cookies, instead of you copying them from a
 browser. It works with the BRiSK sites of SBI, Matsui, Monex and SMBC Nikko, or any broker you
-add, and needs Chrome, Node 22+ and the macOS Keychain.
+add. It needs Chrome, Node 22+ and a safe place for the passkey: the macOS Keychain or Windows
+Credential Manager (on Linux, an owner-only file you opt into). It runs on macOS and Windows (run it
+from PowerShell or `cmd` so it uses Windows' own Chrome and Node, not WSL's) and is also tested on Linux.
 
 ### How it works
 
@@ -145,8 +147,8 @@ without asking. The broker's site cannot tell the difference.
    page (a temporary profile, not your everyday Chrome). Sign in as you normally would, then
    register a new passkey in the broker's security settings, just as you would for a new phone.
    The virtual authenticator receives it. When the site says it is registered, press Enter in
-   the terminal: `briskapi` saves the passkey and your broker choice in the macOS Keychain, and
-   Chrome closes.
+   the terminal: `briskapi` saves the passkey and your broker choice in the macOS Keychain or Windows Credential
+   Manager, and Chrome closes.
 2. **Each session, `brisk login`.** The same Chrome opens with the saved passkey loaded, goes to the
    login page and presses the passkey button, and the virtual authenticator signs. Open BRiSK from
    the broker's site in that window (or pass `--launch-url` to have it opened for you).
@@ -161,8 +163,9 @@ lists one more passkey, which you can delete in its security settings.
 ### What to know
 
 - **The saved passkey is a credential.** Whoever has it can sign in to your broker account with no
-  further check. It is kept only in the Keychain (`BRISK_PASSKEY_STORE=file` keeps it in an
-  owner-only file instead, which is weaker), never leaves your machine and is never shown in a
+  further check. It is kept only in the Keychain or Credential Manager (`BRISK_PASSKEY_STORE=file` keeps it in an
+  owner-only file instead, which is weaker; on Windows that file's privacy comes from your user
+  profile folder, which only you and administrators can read), never leaves your machine and is never shown in a
   log. `brisk forget` deletes it here; remove it at the broker too.
 - **It is experimental.** Each broker's login page, passkey button text and BRiSK launch come from
   its public pages, and none has been tried against a live account. Override them with
