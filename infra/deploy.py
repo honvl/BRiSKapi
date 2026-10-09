@@ -30,7 +30,7 @@ def package():
         # An empty package init keeps the client API (and its dependencies) out.
         z.writestr('briskapi/__init__.py','')
         z.write(ROOT/'briskapi/schema.py','briskapi/schema.py')
-        # Reference fingerprints let ingest reject anything but genuine replays.
+        # Reference fingerprints verify demo/synthetic content; SBI is structurally checked.
         for path in sorted((ROOT/'briskapi/references').glob('*.json')):
             z.write(path,f'briskapi/references/{path.name}')
     return code.getvalue()

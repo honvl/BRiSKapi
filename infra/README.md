@@ -24,7 +24,8 @@ particular key and exact size. Public bucket policy permits only TLS reads of
 `archive/` and listing that prefix. ACLs are disabled, encryption and versioning
 enabled. Logs expire after 14 days.
 
-Ingest accepts only canonical recordings that match a reference replay and
+Ingest accepts canonical demo/synthetic recordings that match a reference replay
+and opted-in decoded SBI recordings with structural/continuity checks. It
 publishes its own gzip of the validated content (see the integrity section of
 [ARCHITECTURE.md](../ARCHITECTURE.md)). The deployment package holds
 `archive_service.py`, `briskapi/schema.py` and `briskapi/references/*.json`,

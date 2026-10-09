@@ -4,6 +4,7 @@ import datetime as dt
 import io
 import json
 import os
+from pathlib import Path
 import stat
 import sys
 import urllib.error
@@ -15,6 +16,7 @@ import pytest
 
 import briskapi
 import briskapi.cli as cli
+import briskapi.schema as schema
 from briskapi import sbi
 from briskapi._recording import JST
 
@@ -67,6 +69,7 @@ def client(**routes):
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
     monkeypatch.delenv('BRISK_SBI_COOKIES', raising=False)
+    monkeypatch.delenv('BRISK_CONTRIBUTE', raising=False)
     monkeypatch.setattr(sbi, '_client', None)
     monkeypatch.setattr(briskapi, '_current', None)
 
@@ -131,8 +134,9 @@ def test_errors(status, error):
 
 
 def test_session_rules(monkeypatch):
-    with pytest.raises(sbi.SessionExpiredError, match='login'):
-        sbi.Session({})
+    for cookies in ({}, None, {'session_bfaf77a2': ''}, []):
+        with pytest.raises(sbi.SessionExpiredError, match='login'):
+            sbi.Session(cookies)
     assert sbi._NoRedirect().redirect_request(None, None, 302, 'Found', {}, 'https://elsewhere.test/') is None
     slept = []
     monkeypatch.setattr(sbi.time, 'sleep', slept.append)
@@ -167,17 +171,22 @@ MIDNIGHT_MS = int(dt.datetime(2026, 3, 11, tzinfo=JST).timestamp() * 1000)
 
 def sbi_session(frames=150):
     """Bootstrap, `frames` one-quote batches 100 ms apart (20 ms old on receipt, one 1.5 s stall) and end."""
-    q = {'issue_id': 0, 'code': '7203', 'frame': 1, 'max_frame': 1, 'source_time_us': OPEN_US,
+    q = {**dict.fromkeys(schema.QUOTE_KEYS - {'issue_status'}, 0),
+         'issue_id': 0, 'code': '7203', 'frame': 1, 'max_frame': 1, 'source_time_us': OPEN_US,
          'indicative_price10': 101500, 'market_buy_quantity': 3, 'market_sell_quantity': 1}
+    master = {**dict.fromkeys(schema.MASTER_KEYS, 0), 'issue_id': 0, 'code': '7203', 'name': 'Toyota', 'lot_size': 100}
     batches = [dict(type='bootstrap', seq=0, source='sbi_live', trading_date='20260311', source_time_us=OPEN_US,
-                    market_issue_count=1, master=[{'issue_id': 0, 'code': '7203', 'name': 'Toyota'}], quotes=[q])]
+                    input_transport={**schema.SBI_TRANSPORT, 'decoder': '/private/decoder.js', 'setup_ms': 1.123456},
+                    source_timestamp_origin='brisk_decoder_unverified', exchange_delay_ms=None,
+                    market_issue_count=1, master=[master], quotes=[q])]
     for i in range(1, frames + 1):
         now = OPEN_US + i * 100_000 + (1_400_000 if i > 100 else 0)
         batches.append(dict(type='quotes', seq=i, source_time_us=now, received_unix_ms=MIDNIGHT_MS + now // 1000 + 20,
                             decode_ns=250_000 + i * 1000, replay_lateness_ms=None,
                             quotes=[{**q, 'frame': i + 1, 'max_frame': i + 1, 'source_time_us': now,
                                      'last_price10': 101500 + 100 * (i == frames)}]))
-    return batches + [dict(type='end', seq=frames + 1, source_time_us=now, frames=frames, quote_updates=frames)]
+    return batches + [dict(type='end', seq=frames + 1, source_time_us=now, frames=frames, quote_updates=frames,
+                          replay_wall_ms=16_400)]
 
 
 @pytest.fixture
@@ -265,3 +274,86 @@ def test_sbi_feed_contributes_timing_only(fake_host, monkeypatch):
     monkeypatch.setattr(cli, 'contribute_timing', lambda *a: 1 / 0)
     with pytest.warns(UserWarning, match='Timing contribution failed'):
         assert sbi.connect().wait().timing_contribution['status'] == 'failed'
+
+
+def test_cli_without_cookies_stops_before_prompt_or_decoder(monkeypatch, capsys):
+    monkeypatch.setattr(cli, 'check_node', lambda *args: pytest.fail('decoder must not start'))
+    monkeypatch.setattr(cli, 'ask_consent', lambda: pytest.fail('do not prompt without cookies'))
+    with pytest.raises(SystemExit, match='No SBI BRiSK cookies'):
+        cli.main(['live', '--sbi'])
+    assert 'Decoder exited' not in capsys.readouterr().err
+
+
+def test_sbi_market_sharing_requires_current_consent(fake_host):
+    sbi.login({'session_bfaf77a2': 'v'})
+    with pytest.raises(briskapi.BriskError, match='consent'):
+        sbi.connect(share_market_data=True)
+    cli.consent_path().parent.mkdir(parents=True, exist_ok=True)
+    cli.consent_path().write_text(json.dumps({'policy_version': 2, 'enabled': True,
+                                            'contributor': 'old', 'license': 'CC0-1.0'}))
+    with pytest.raises(briskapi.BriskError, match='consent'):
+        sbi.connect(share_market_data=True)
+
+
+def test_sbi_market_sharing_is_explicit_and_honors_opt_out(fake_host, monkeypatch):
+    sbi.login({'session_bfaf77a2': 'v'})
+    briskapi.consent(accept=True, contributor='owner')
+    sent = []
+    def publish(directory, url, **options):
+        m = json.loads((directory / 'manifest.json').read_text())
+        schema.inspect_package(directory / 'events.jsonl.gz', m)
+        sent.append(m)
+        return {'status': 'published'}
+    monkeypatch.setattr(cli, 'contribute', publish)
+    monkeypatch.setattr(cli, 'contribute_timing', lambda *args: {'status': 'published'})
+    assert sbi.connect().wait().contribution is None and not sent
+    feed = sbi.connect(share_market_data=True).wait()
+    assert feed.contribution == {'status': 'published'} and len(sent) == 1
+    assert sent[0]['summary']['source'] == 'sbi_live' and sent[0]['contributor'] == 'owner'
+    assert not Path(feed._tmp.name).exists()
+    assert sbi.connect(share_market_data=True, contribute=False).wait().contribution is None
+    monkeypatch.setenv('BRISK_CONTRIBUTE', '0')
+    feed = sbi.connect(share_market_data=True).wait()
+    assert feed.contribution is None and feed.timing_contribution is None and len(sent) == 1
+
+
+@pytest.mark.parametrize('answer,shared', [('\n', True), ('y\n', True), ('n\n', False), ('', False)])
+def test_cli_asks_for_each_sbi_capture_and_enter_opts_in(fake_host, monkeypatch, capsys, answer, shared):
+    monkeypatch.setenv('BRISK_SBI_COOKIES', '{"session_bfaf77a2": "v"}')
+    briskapi.consent(accept=True, contributor='owner')
+    monkeypatch.setattr(cli, 'interactive', lambda: True)
+    sent = []
+    monkeypatch.setattr(cli, 'contribute', lambda *args, **kwargs: sent.append(args) or {'status': 'published'})
+    monkeypatch.setattr(cli, 'contribute_timing', lambda *args: {'status': 'published'})
+    for run in range(2):
+        monkeypatch.setattr(cli.sys, 'stdin', io.StringIO(answer))
+        cli.main(['live', '--sbi'])
+        out = capsys.readouterr()
+        assert 'Share this SBI capture publicly?' in out.err and '[Y/n]' in out.err
+        assert len(sent) == (run + 1 if shared else 0)
+    assert cli.load_consent()['enabled']  # Per-session choice does not change the saved consent.
+
+
+@pytest.mark.parametrize('flag,shared', [('--share-market-data', True), ('--no-share-market-data', False)])
+def test_cli_sbi_market_sharing_flags(fake_host, monkeypatch, flag, shared):
+    monkeypatch.setenv('BRISK_SBI_COOKIES', '{"session_bfaf77a2": "v"}')
+    briskapi.consent(accept=True, contributor='owner')
+    monkeypatch.setattr(cli, 'ask_sbi_market_sharing', lambda *args: pytest.fail('explicit flag suppresses prompt'))
+    sent = []
+    monkeypatch.setattr(cli, 'contribute', lambda *args, **kwargs: sent.append(args) or {'status': 'published'})
+    monkeypatch.setattr(cli, 'contribute_timing', lambda *args: {'status': 'published'})
+    cli.main(['live', '--sbi', flag])
+    assert bool(sent) == shared
+
+
+def test_opted_in_sbi_capture_closed_early_does_not_publish(tmp_path, monkeypatch):
+    script = tmp_path / 'held.cjs'
+    script.write_text(f'console.log({json.dumps(json.dumps(sbi_session()[0]))});\nsetInterval(() => {{}}, 1000);\n')
+    monkeypatch.setattr(sbi, 'DECODER', script)
+    monkeypatch.setattr(cli, 'contribute', lambda *args, **kwargs: pytest.fail('incomplete capture must stay local'))
+    sbi.login({'session_bfaf77a2': 'v'})
+    briskapi.consent(accept=True, contributor='owner')
+    feed = sbi.connect(share_market_data=True)
+    feed.close()
+    assert feed.status == 'closed' and feed.contribution is None
+    assert not Path(feed._tmp.name).exists()

@@ -104,11 +104,49 @@ def test_market(recording, tmp_path):
     assert len(ranked) == 1 and ranked[0]['code'] == '7203' and ranked[0]['market_order_imbalance'] == 95600
     assert len(m.imbalances(at='08:59:59.99999')) == 2
     summary = m.summary()
-    assert summary['securities'] == 2 and 'end' not in summary
+    assert summary['securities'] == 2 and summary['end'].microsecond == 30
     (recording.directory / 'manifest.json').write_text(json.dumps(
         {'summary': {'last_source_time_us': 32_400_000_030, 'batches': 5}, 'contributor': 'alice', 'license': 'CC0-1.0'}))
     summary = brisk.Market(brisk.Recording(recording.directory)).summary()
     assert summary['contributor'] == 'alice' and summary['end'].microsecond == 30
+
+
+def test_state_uses_quote_clocks_even_in_later_batches(recording):
+    batches = market()
+    open_us = 32_400_000_000
+    batches[0]['quotes'][0]['source_time_us'] = open_us - 7655
+    batches[0]['quotes'][1]['source_time_us'] = open_us - 6449
+    batches[1]['quotes'][0]['source_time_us'] = open_us + 5
+    recording.path.write_text(''.join(json.dumps(b) + '\n' for b in batches))
+    toyota = brisk.Ticker('7203', recording)
+    initial = toyota.history(raw=True)[0]
+    assert toyota.quote(at='08:59:59.9999', raw=True) == initial
+    assert toyota.quote(at=initial['source_time_us'], raw=True) == initial
+    with pytest.raises(brisk.NotFoundError):
+        toyota.quote(at=initial['source_time_us'] - 1)
+    with pytest.raises(brisk.NotFoundError):
+        toyota.quote(at='08:59:59.99')
+    # The 09:00:00.000010 batch contains a quote stamped .000005.
+    assert toyota.quote(at=open_us + 5, raw=True) == toyota.history(end=open_us + 5, raw=True)[-1]
+    snapshot = brisk.Market(recording).snapshot(at=open_us + 5, raw=True)
+    assert [q['frame'] for q in snapshot] == [1, 2]
+    assert all(q['source_time_us'] <= open_us + 5 for q in snapshot)
+    assert toyota.quote()['frame'] == 3
+    assert toyota.quote(at='08:59:59.9999')['frame'] == 1  # final cache does not affect past queries
+
+
+@pytest.mark.parametrize('compressed', [False, True])
+def test_summary_covers_empty_batches_and_caches_the_range(tmp_path, monkeypatch, compressed):
+    batches = market()
+    batches[-1]['source_time_us'] += 100
+    data = ''.join(json.dumps(b) + '\n' for b in batches).encode()
+    path = tmp_path / ('events.jsonl.gz' if compressed else 'events.jsonl')
+    path.write_bytes(gzip.compress(data) if compressed else data)
+    rec = brisk.Recording(path)
+    summary = brisk.Market(rec).summary()
+    assert summary['start'].microsecond == 999955 and summary['end'].microsecond == 130
+    monkeypatch.setattr(rec, 'batches', lambda: pytest.fail('clock range should be cached'))
+    assert brisk.Market(rec).summary() == summary
 
 
 @pytest.mark.parametrize('at,expected', [
@@ -275,6 +313,7 @@ def test_live_feed(gated_decoder, tmp_path):
     with brisk.connect(cache=tmp_path, codes=['7203', '6758'], contribute=False, history=True) as feed:
         assert feed.status == 'running' and brisk.current() is feed and 'running' in repr(feed)
         assert feed.codes == ['6758', '7203'] and feed.source == 'historical_mock' and feed.trading_date == '20210927'
+        assert brisk.Market().summary()['start'] == brisk.Market().summary()['end']
         assert brisk.Ticker('7203').quote()['indicative_price'] == 10150.0
         assert brisk.Market().imbalances(top=1)[0]['code'] == '7203'
         sony = []
@@ -288,6 +327,7 @@ def test_live_feed(gated_decoder, tmp_path):
         assert [q['frame'] for q in toyota] == [2, 3]
         feed.wait()
         assert feed.status == 'completed' and feed.seq == 4 and feed.contribution is None
+        assert brisk.Market().summary()['end'].microsecond == 30
         assert sony == [1, 2] and len(raw_all) == 2 and 'last_price10' in raw_all[0]
         assert [q['frame'] for q in feed.updates('7203')] == [1, 2, 3]
         assert [q['frame'] for q in brisk.Ticker('7203').history(start='09:00:00.000011')] == [3]

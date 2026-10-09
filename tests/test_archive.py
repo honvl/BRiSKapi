@@ -398,6 +398,113 @@ def test_pull_tampered_atomic(packaged, tmp_path):
     with pytest.raises(ValueError):
         cli.pull(s3, 'bucket', 'incoming/secret', tmp_path / 'bad')
 
+
+@pytest.mark.parametrize('invalid', ['schema', 'source', 'sample', 'legacy_probe', 'json', 'oversize', 'identity', 'types'])
+def test_listing_skips_invalid_entries_and_keeps_valid_ones(packaged, invalid, monkeypatch, capsys):
+    _, m = packaged
+    s3 = S3()
+    bad = copy.deepcopy(m)
+    bad['sha256'] = 'a' * 64
+    if invalid == 'schema':
+        bad['schema'] = 'brisk-sbi-wire-jsonl-v1'
+    elif invalid == 'source':
+        bad['summary']['source'] = 'sbi_legacy_capture'
+    elif invalid == 'sample':
+        bad['schema'] = 'brisk-sbi-wire-jsonl-v1'
+        bad['summary']['source'] = 'sample_data'
+    elif invalid == 'legacy_probe':
+        bad['summary']['batches'] = 2
+    elif invalid == 'identity':
+        bad['sha256'] = 'b' * 64
+    elif invalid == 'types':
+        bad['summary']['source'] = []
+    bad_prefix = 'archive/20210927/' + 'a' * 64
+    data = json.dumps(bad).encode()
+    if invalid == 'json':
+        data = b'{'
+    elif invalid == 'oversize':
+        data += b' ' * 65537
+    s3.objects[bad_prefix + '/manifest.json'] = data
+    prefix = f"archive/20210927/{m['sha256']}"
+    service.json_put(s3, prefix + '/manifest.json', m)
+    with pytest.warns(UserWarning, match='Skipping invalid or unsupported archive manifest'):
+        assert list(cli.manifests(s3, 'bucket')) == [(prefix, m)]
+    # Both user-facing catalogs use the same tolerant listing path.
+    monkeypatch.setattr(cli, 'client', lambda config: s3)
+    from briskapi import Archive
+    with pytest.warns(UserWarning):
+        assert Archive().recordings()[0]['prefix'] == prefix
+    with pytest.warns(UserWarning):
+        cli.main(['list'])
+    assert json.loads(capsys.readouterr().out)['prefix'] == prefix
+
+
+@pytest.mark.parametrize('change', [{'schema': 'brisk-sbi-wire-jsonl-v1'}, {'source': 'sbi_legacy_capture'},
+                                  {'batches': 2}, {'sha256': 'b' * 64}])
+def test_pull_rejects_manifest_before_fetching_payload(packaged, tmp_path, change):
+    _, m = packaged
+    bad = copy.deepcopy(m)
+    prefix = f"archive/20210927/{m['sha256']}"
+    for key, value in change.items():
+        (bad if key in {'schema', 'sha256'} else bad['summary'])[key] = value
+    s3 = S3()
+    service.json_put(s3, prefix + '/manifest.json', bad)
+    # No payload object exists: requesting one would raise ClientError.
+    with pytest.raises(ValueError):
+        cli.pull(s3, 'bucket', prefix, tmp_path / 'download')
+    assert not (tmp_path / 'download').exists()
+
+
+def sbi_batches():
+    records = batches()
+    records[0].update(source='sbi_live', trading_date='20260311',
+                      input_transport={**schema.SBI_TRANSPORT, 'decoder': '/private/decoder.js', 'session': 'secret'})
+    for batch in records:
+        for q in batch.get('quotes', []):
+            q.pop('issue_status')
+    records[1]['replay_lateness_ms'] = None
+    records[-1]['frames'] = 5  # Includes frames used to catch up before bootstrap.
+    return records
+
+
+def test_sbi_market_recording_publish_and_pull(tmp_path):
+    events = tmp_path / 'sbi.jsonl'
+    events.write_bytes(stream(sbi_batches()).read())
+    directory = tmp_path / 'package'
+    m = cli.package(events, directory, 'sbi-contributor', 'CC-BY-4.0')
+    assert m['summary']['source'] == 'sbi_live' and m['redistribution_permitted']
+    s3, db = S3(), DB()
+    ticket = ticket_for(s3, db, m)
+    service.ingest(upload(s3, m, directory, ticket), s3, db)
+    status = service.json_get(s3, f'incoming/{ticket}/status.json')
+    assert status['status'] == 'published'
+    cli.pull(s3, 'bucket', status['prefix'], tmp_path / 'download')
+    data = (tmp_path / 'download/events.jsonl').read_bytes()
+    assert b'secret' not in data and b'/private/' not in data
+    assert json.loads(data.splitlines()[0])['input_transport'] == schema.SBI_TRANSPORT
+    assert list(cli.manifests(s3, 'bucket'))[0][1]['summary']['source'] == 'sbi_live'
+    m['redistribution_permitted'] = False
+    with pytest.raises(ValueError, match='Redistribution'):
+        ticket_for(s3, db, m)
+
+
+@pytest.mark.parametrize('change', [
+    lambda b: b[0].update(cookies={'session': 'secret'}),
+    lambda b: b[0]['input_transport'].update(token='secret'),
+    lambda b: b[0]['quotes'][0].update(issue_status=0),
+    lambda b: b[1]['quotes'][0].update(token='secret'),
+    lambda b: b[1]['quotes'][0].pop('volume'),
+    lambda b: b[1].update(replay_lateness_ms=0),
+    lambda b: b[-1].update(frames=0),
+    lambda b: b[-1].update(quote_updates=0),
+])
+def test_sbi_market_recording_rejects_unknown_fields_and_bad_continuity(change):
+    records = sbi_batches()
+    records[0]['input_transport'] = dict(schema.SBI_TRANSPORT)
+    change(records)
+    with pytest.raises(ValueError):
+        schema.validate_stream(stream(records))
+
 class HTTP:
     def __init__(self, value=b''): self.value = value
     def __enter__(self): return self

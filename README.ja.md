@@ -63,15 +63,25 @@ feed.wait()           # または feed.close()。`with briskapi.connect(...) as 
 ## 記録データとアーカイブ
 
 ```python
-briskapi.recordings(source="historical_mock")   # 公開済みの記録一覧（AWS アカウント不要）
-briskapi.pull("archive/20210927/SHA256")       # ダウンロード・検証・展開・キャッシュし、既定のデータにする
-briskapi.load("recordings/my-session")         # ローカルの記録（events.jsonl[.gz] またはフォルダー）
-briskapi.record("recordings/my-session", web=True)   # デモを自分で記録
+recordings = briskapi.recordings(source="historical_mock")   # AWS アカウント不要
+if recordings:
+    briskapi.pull(recordings[0]["prefix"])      # 検証・展開・キャッシュし、既定のデータにする
+else:
+    briskapi.record("recordings/my-session", web=True)   # アーカイブが空ならデモを自分で記録
+# または briskapi.load("recordings/my-session") でローカルの events.jsonl[.gz] やフォルダーを読む。
 
-briskapi.Ticker("7203").quote(at="08:59:59.99")               # 任意の日本時間時点の状態
+briskapi.Ticker("7203").quote(at="08:59:59.9999")             # 寄り前の気配（日本時間）
 briskapi.Ticker("7203").history(start="09:00", end="09:01")   # 期間内のすべての更新
 briskapi.Market().snapshot(at="09:00:00").to_pandas()
 ```
+
+時刻の照会には、バッチではなく各気配のタイムスタンプを使います。デモの
+7203 の最初の気配は日本時間 08:59:59.993551 で、それより前は `NotFoundError`
+になります。`Market().summary()` はローカルの記録やライブフィードでも `start`
+と `end` を返します。アーカイブの一覧では、不正または未対応の記録を警告付きで
+スキップします。デモの記録がない場合もあり、`synthetic_test` は公開処理のテスト用です。
+既存の [サンプルデータ](https://brisk-recordings-honvl-tokyo.s3.ap-northeast-1.amazonaws.com/archive/20260311/cca870a51e7f96f16009c3709c3f597d314b22ed8922bb3ea7fa1acc67a0f85f/events.jsonl.gz)
+はプロトコル調査用の SBI 通信形式で、通信形式に対応したデコーダーが必要です。
 
 ## SBI BRiSK
 
@@ -94,8 +104,11 @@ market.events()       # バスケット注文、ストップ高・安、出来�
 market.schedule()     # 取引日、状態、取引時間
 market.watchlist()    # 保存済みの銘柄コード
 
-feed = sbi.connect(codes=["7203"])          # ライブ（試験的）
+feed = sbi.connect(codes=["7203"])          # ライブ（試験的）。タイミング共有は保存済みの同意に従う
 toyota.quote()                              # 他のフィードと同じ呼び出し
+# このセッションの市場データも共有する場合は、まず現行ポリシーに同意する:
+# briskapi.consent(accept=True, contributor="your-alias", license="CC0-1.0")
+# feed = sbi.connect(codes=["7203"], share_market_data=True)
 ```
 
 結果は下記の規約に従います。エラーは `sbi.SessionExpiredError`（再ログインが
@@ -111,9 +124,10 @@ Node 上で動かします。ブラウザは使いません。ベンダーのク
 ター、`startLive` のペイロード、追いつき要求の本文）。`sbi.connect(profile={...})`
 で設定し、`trace_protocol=True`（トークンはすべて伏せ字）でサーバーの応答を確認
 してください。正しくなるまでは、推測で動かさず、明示的なエラーで止まります。
-結果をぜひお知らせください。Cookie は sbi.brisk.jp にのみ送られ、SBI の市場データが
-お使いのコンピューターから出ることはありません。共有をオンにすると、セッションは
-タイミングの要約だけを共有します（下記参照）。
+結果をぜひお知らせください。Cookie は sbi.brisk.jp にのみ送られます。SBI の市場
+データは、その記録の開始時に明示的に同意した場合だけ共有します。Python API では
+`share_market_data=True` が必要です。共有がオンなら、市場データの共有を断っても
+タイミングの要約は共有します。
 
 ## API リファレンス
 
@@ -151,13 +165,19 @@ brisk live --web --codes 7203,6758          # 気配の更新ごとに JSON を1
 brisk live --sbi --codes 7203               # SBI BRiSK。Cookie は BRISK_SBI_COOKIES（JSON）から。--trace-protocol で接続手順を表示（通信の詳細は BRISK_SBI_PROFILE）
 brisk record --web --output recordings/s1   # デモを記録（同意済みなら共有）
 brisk list --date 20210927 --source historical_mock
-brisk pull archive/20210927/SHA256 --output recordings/downloaded
+brisk pull PREFIX --output recordings/downloaded   # brisk list が返した prefix を使う
 brisk consent [--accept | --revoke]         # 共有設定の表示・変更
 brisk upload recordings/s1                  # 記録の共有を再試行
 ```
 
 各コマンドの詳細は `--help` で確認できます。`pull` はすべて検証してから
 書き込み、既存のフォルダーを上書きすることはありません。
+
+共有がオンの場合、対話型の `brisk live --sbi` は記録開始時に毎回、そのセッションの
+市場データを公開するか確認します。Enter で今回だけ同意し、この選択は保存しません。
+スクリプトでは `--share-market-data` で同意でき、`--no-share-market-data` なら確認
+せずに断れます。公開にはセッションの正常終了が必要です。`brisk list --source sbi_live`
+で共有された SBI の記録を一覧できます。市場データの正確性は提供者の申告に基づきます。
 
 ## 記録の共有
 
@@ -167,10 +187,13 @@ brisk upload recordings/s1                  # 記録の共有を再試行
 Python API から確認を求めることはありません。決めるまでは、セッションは
 お使いのコンピューターにだけ保存されます。
 
-- **SBI のセッションはタイミングのみ共有:** デコード時間、受信時のデータの
+- **SBI のタイミング共有:** デコード時間、受信時のデータの
   遅れ、フレーム間隔のパーセンタイル、停滞回数、フレーム数、取引日、最初と
-  最後の分、エイリアスとライセンスだけです。価格、数量、銘柄コードは一切
-  共有しません。`briskapi.Archive().timing()` で全員のレポートを一覧できます。
+  最後の分、エイリアスとライセンスです。`briskapi.Archive().timing()` で全員の
+  レポートを一覧できます。
+- **任意の SBI 市場データ共有:** 記録開始時に毎回明示的に同意すると、デコードした
+  銘柄マスター、価格、数量、銘柄コード、ローカルの計測値も公開アーカイブに追加
+  します。Cookie、トークン、接続の診断情報は含めません。
 - **デモのセッションで共有される内容:** 記録した市場データ、ローカルの計測値（お使いの
   コンピューターの時計を含み、記録した日時がわかります）、公開エイリアス
   （既定はランダムな `anon-…`）とライセンス。IP アドレスはアップロード回数の

@@ -107,11 +107,12 @@ class Market:
         """Source, trading date, coverage and replay clock range."""
         rec = self.recording
         b = rec.bootstrap
+        first, last = rec.clock_range
         info = {'source': b['source'], 'trading_date': b['trading_date'], 'securities': len(b['master']),
-                'market_issue_count': b['market_issue_count'], 'start': timestamp(b['trading_date'], b['source_time_us'])}
+                'market_issue_count': b['market_issue_count'], 'start': timestamp(b['trading_date'], first),
+                'end': timestamp(b['trading_date'], last)}
         if rec.manifest:
-            info |= {'end': timestamp(b['trading_date'], rec.manifest['summary']['last_source_time_us']),
-                     'batches': rec.manifest['summary']['batches'], 'contributor': rec.manifest['contributor'],
+            info |= {'batches': rec.manifest['summary']['batches'], 'contributor': rec.manifest['contributor'],
                      'license': rec.manifest['license']}
         return info
 

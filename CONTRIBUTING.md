@@ -44,9 +44,16 @@ behavior.
 Keep `README.md` and `README.ja.md` in step; internals belong in `ARCHITECTURE.md`.
 Everything the installed package needs at runtime lives in `briskapi/` (package
 data is listed in `pyproject.toml`); CI installs the wheel outside the repository
-and runs it. SBI tests use pybrisk's sample payloads and a fake server. SBI market data
-must never reach the archive; SBI sessions contribute timing reports only
+and runs it. SBI tests use pybrisk's sample payloads and a fake server. SBI market
+recordings need an explicit opt-in at the beginning of each capture (Enter accepts
+the interactive prompt), plus current consent and a redistribution declaration.
+Without that opt-in, SBI sessions contribute timing reports only
 (`briskapi/timing.py`, validated by `validate_timing` in `briskapi/schema.py`).
+Live market content has no reference replay; it passes structural and continuity
+checks, while its accuracy and redistribution permission remain contributor-declared.
+Never archive cookies, tokens or connection diagnostics. New uploads must be
+decoded; the existing legacy wire capture is labeled `sample_data` and is not an
+ingest format.
 
 ## Releases
 

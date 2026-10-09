@@ -30,7 +30,7 @@ DECODER = PACKAGE / 'decoder' / 'decoder.cjs'
 MIN_NODE = 22
 LICENSES = ('CC0-1.0', 'CC-BY-4.0')
 # Bump with any PRIVACY.md change to what is collected; saved choices then lapse.
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 NOTICE = '''\
 Sessions are contributed to the shared public BRiSK archive automatically.
 After each clean, complete demo replay the contribution contains:
@@ -38,9 +38,13 @@ After each clean, complete demo replay the contribution contains:
   - local timing measurements: decode durations, replay lateness, asset download
     time and your computer's receipt clock, which shows when you recorded;
   - your public alias and data license, in the published manifest.
-SBI BRiSK sessions contribute only a timing summary: decode time, data age and
-frame spacing percentiles, stalls, frame count, date and start/end minute. No
-prices, quantities or codes.
+SBI BRiSK sessions contribute a timing summary: decode time, data age and frame
+spacing percentiles, stalls, frame count, date and start/end minute. At the start
+of each interactive SBI capture, a separate question asks whether to publish its
+decoded market recording too; Enter accepts for that session only. Scripts can
+opt in with --share-market-data or sbi.connect(share_market_data=True). This
+publishes its securities master, prices, quantities, codes and per-frame timing.
+Cookies, tokens and connection diagnostics are never published.
 Contributions are public and permanent. Your IP address is used only for
 upload rate limiting. No account, file, hostname or system details are sent.
 Accepting declares that you may redistribute these recordings under that license.
@@ -98,6 +102,16 @@ def ask_consent():
     sys.stderr.flush()
     accepted = sys.stdin.readline().strip().lower() in {'', 'y', 'yes'}
     return save_consent(accepted, alias)
+
+def ask_sbi_market_sharing(choice):
+    """An explicit choice at the beginning of each SBI capture; never saved."""
+    sys.stderr.write('Share this SBI capture publicly? This publishes the securities master, codes, prices, '
+                     'quantities and local per-frame timing, after a clean session end. Cookies, tokens and '
+                     'connection diagnostics are excluded. '
+                     f"Publish as '{choice['contributor']}' under {choice['license']}? [Y/n] ")
+    sys.stderr.flush()
+    answer = sys.stdin.readline()
+    return bool(answer) and answer.strip().lower() in {'', 'y', 'yes'}
 
 def declaration(args):
     """Alias and license for this run, or None to keep the recording local."""
@@ -191,11 +205,23 @@ def manifests(s3, bucket, date=None):
     for page in s3.get_paginator('list_objects_v2').paginate(Bucket=bucket, Prefix=prefix):
         for item in page.get('Contents', []):
             if item['Key'].endswith('/manifest.json'):
-                body = s3.get_object(Bucket=bucket, Key=item['Key'])['Body']
-                with body:
-                    m = json.loads(body.read(65537))
-                validate_manifest(m)
-                yield item['Key'].rsplit('/', 1)[0], m
+                entry_prefix = item['Key'].rsplit('/', 1)[0]
+                try:
+                    m = _read_manifest(s3, bucket, entry_prefix)
+                except (ValueError, TypeError, KeyError, RecursionError):
+                    warnings.warn(f'Skipping invalid or unsupported archive manifest: {item["Key"]}', stacklevel=2)
+                    continue
+                yield entry_prefix, m
+
+def _read_manifest(s3, bucket, prefix):
+    obj = s3.get_object(Bucket=bucket, Key=f'{prefix}/manifest.json')
+    with obj['Body'] as body:
+        require(obj['ContentLength'] <= 65536, 'Remote manifest exceeds limit')
+        data = body.read(65537)
+        require(len(data) <= 65536, 'Remote manifest exceeds limit')
+    m = validate_manifest(json.loads(data))
+    require(prefix == f"archive/{m['summary']['trading_date']}/{m['sha256']}", 'Archive identity mismatch')
+    return m
 
 def pull(s3, bucket, prefix, output):
     require(re.fullmatch(r'archive/\d{8}/[0-9a-f]{64}', prefix), 'Invalid archive prefix')
@@ -203,20 +229,21 @@ def pull(s3, bucket, prefix, output):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
         directory = Path(tmp)
-        for name in ('manifest.json', 'events.jsonl.gz'):
-            obj = s3.get_object(Bucket=bucket, Key=f'{prefix}/{name}')
-            limit = 65536 if name == 'manifest.json' else 64 * 1024**2
+        # Refuse unsupported sources and identities before downloading payloads.
+        m = _read_manifest(s3, bucket, prefix)
+        (directory / 'manifest.json').write_text(json.dumps(m, indent=2) + '\n')
+        path = directory / 'events.jsonl.gz'
+        obj = s3.get_object(Bucket=bucket, Key=f'{prefix}/events.jsonl.gz')
+        limit = 64 * 1024**2
+        with obj['Body'] as body, path.open('wb') as target:
             require(obj['ContentLength'] <= limit, 'Remote object exceeds limit')
-            with obj['Body'] as body, (directory / name).open('wb') as target:
-                size = 0
-                while chunk := body.read(1024 * 1024):
-                    size += len(chunk)
-                    require(size <= limit, 'Remote object exceeds limit')
-                    target.write(chunk)
-        m = json.loads((directory / 'manifest.json').read_text())
-        inspect_package(directory / 'events.jsonl.gz', m)
-        require(prefix == f"archive/{m['summary']['trading_date']}/{m['sha256']}", 'Archive identity mismatch')
-        with gzip.open(directory / 'events.jsonl.gz', 'rb') as source, (directory / 'events.jsonl').open('wb') as target:
+            size = 0
+            while chunk := body.read(1024 * 1024):
+                size += len(chunk)
+                require(size <= limit, 'Remote object exceeds limit')
+                target.write(chunk)
+        inspect_package(path, m)
+        with gzip.open(path, 'rb') as source, (directory / 'events.jsonl').open('wb') as target:
             shutil.copyfileobj(source, target)
         shutil.move(str(directory), str(output))
     return m
@@ -246,13 +273,19 @@ def live(args):
     """Print each quote update as one JSON line; a complete session is contributed per consent."""
     from briskapi import connect, sbi  # The API package builds on this module.
     codes = args.codes.split(',') if args.codes else None
+    if args.sbi:
+        sbi.login()  # Missing cookies fail before consent prompts or decoder startup.
     if load_consent() is None and os.environ.get('BRISK_CONTRIBUTE') != '0' and interactive():
         ask_consent()
+    share_market_data = args.share_market_data
+    choice = load_consent()
+    if (args.sbi and share_market_data is None and choice and choice['enabled']
+            and os.environ.get('BRISK_CONTRIBUTE') != '0' and interactive()):
+        share_market_data = ask_sbi_market_sharing(choice)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always')
-        if args.sbi:  # Market data stays local; only a timing summary is contributed.
-            sbi.login()
-            feed = sbi.connect(codes=codes, trace_protocol=args.trace_protocol)
+        if args.sbi:
+            feed = sbi.connect(codes=codes, trace_protocol=args.trace_protocol, share_market_data=bool(share_market_data))
         else:
             feed = connect(web=args.web, cache=args.cache, codes=codes, speed=args.speed, limit_frames=args.limit_frames)
     for warning in caught:
@@ -265,6 +298,8 @@ def live(args):
         feed.close()
     if feed.contribution:
         print(json.dumps({'contribution': feed.contribution}), file=sys.stderr)
+    if feed.timing_contribution:
+        print(json.dumps({'timing_contribution': feed.timing_contribution}), file=sys.stderr)
 
 def main(argv=None):
     try:
@@ -310,8 +345,10 @@ def _main(argv):
                        help='Live SBI BRiSK (experimental); cookies from BRISK_SBI_COOKIES or saved with sbi.login(remember=True)')
     p.add_argument('--trace-protocol', action='store_true',
                    help='With --sbi: print the connection steps to stderr, every token redacted (wire details in BRISK_SBI_PROFILE)')
+    p.add_argument('--share-market-data', action=argparse.BooleanOptionalAction, default=None,
+                   help='With --sbi and consent: share this decoded market session (interactive default: ask, Enter accepts)')
     p = sub.add_parser('upload', help='Contribute a prepared package'); p.add_argument('directory', type=Path)
-    p = sub.add_parser('list', help='List published recordings'); p.add_argument('--date'); p.add_argument('--source', choices=['historical_mock','synthetic_test'])
+    p = sub.add_parser('list', help='List published recordings'); p.add_argument('--date'); p.add_argument('--source', choices=['historical_mock','synthetic_test','sbi_live'])
     p = sub.add_parser('pull', help='Download and verify a recording'); p.add_argument('prefix'); p.add_argument('--output', type=Path, required=True)
     p = sub.add_parser('consent', help='Show or change automatic contribution')
     group = p.add_mutually_exclusive_group()
@@ -319,6 +356,8 @@ def _main(argv):
     group.add_argument('--revoke', action='store_true')
     p.add_argument('--contributor'); p.add_argument('--license', choices=LICENSES)
     args = parser.parse_args(argv)
+    if args.command == 'live' and args.share_market_data and not args.sbi:
+        parser.error('--share-market-data requires --sbi')
     config = settings(args.config)
     if args.command == 'consent':
         if args.accept:

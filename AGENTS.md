@@ -3,8 +3,11 @@
 Use Python in `.venv`; install `requirements-dev.txt` for local archive tests.
 Do not commit downloaded vendor assets, market recordings, AWS credentials or
 upload tickets or SBI session cookies. Public `briskapi/archive.json` contains only
-bucket, region and API URL. SBI market data must never reach the archive; SBI
-sessions contribute timing reports only.
+bucket, region and API URL. SBI market recordings require explicit opt-in at the
+beginning of each capture (Enter accepts the interactive prompt) and current
+contribution consent. Other SBI sessions contribute timing reports only. Never
+archive cookies, tokens or connection diagnostics. New uploads must be decoded;
+the existing legacy wire capture is labeled sample_data and is not an ingest format.
 
 Run focused archive and API coverage (minimum 85%), the fixture reference test,
 Node tests and Rust tests/fmt/Clippy. CI supplies downloaded demo fixtures. Keep README.md (usage only),

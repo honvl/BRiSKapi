@@ -59,15 +59,25 @@ consumer slows the feed instead of losing updates.
 ## Recordings and the archive
 
 ```python
-briskapi.recordings(source="historical_mock")   # published recordings; no AWS account needed
-briskapi.pull("archive/20210927/SHA256")       # download, verify, decode and cache; becomes the default
-briskapi.load("recordings/my-session")         # or a local recording (events.jsonl[.gz] or folder)
-briskapi.record("recordings/my-session", web=True)   # record the demo yourself
+recordings = briskapi.recordings(source="historical_mock")   # no AWS account needed
+if recordings:
+    briskapi.pull(recordings[0]["prefix"])      # verify, decode and cache; becomes the default
+else:
+    briskapi.record("recordings/my-session", web=True)   # record the demo if the archive is empty
+# Or briskapi.load("recordings/my-session") for a local events.jsonl[.gz] or folder.
 
-briskapi.Ticker("7203").quote(at="08:59:59.99")               # state at any JST time
+briskapi.Ticker("7203").quote(at="08:59:59.9999")             # available pre-open quote, in JST
 briskapi.Ticker("7203").history(start="09:00", end="09:01")   # every update in a window
 briskapi.Market().snapshot(at="09:00:00").to_pandas()
 ```
+
+Time queries use each quote's timestamp. Toyota's first demo quote is at
+08:59:59.993551 JST; an earlier query raises `NotFoundError`. `Market().summary()`
+returns both `start` and `end`, including for local recordings and live feeds.
+Archive listings skip invalid or unsupported recordings with a warning. Demo
+recordings may be absent; `synthetic_test` entries are publication probes.
+The legacy [sample data](https://brisk-recordings-honvl-tokyo.s3.ap-northeast-1.amazonaws.com/archive/20260311/cca870a51e7f96f16009c3709c3f597d314b22ed8922bb3ea7fa1acc67a0f85f/events.jsonl.gz)
+uses the SBI wire format for protocol research and requires a wire-format decoder.
 
 ## SBI BRiSK
 
@@ -90,8 +100,11 @@ market.events()       # basket orders, limit up/down, volume surges
 market.schedule()     # trading date, status and session times
 market.watchlist()    # your saved codes
 
-feed = sbi.connect(codes=["7203"])          # live (experimental)
+feed = sbi.connect(codes=["7203"])          # live (experimental); timing sharing follows consent
 toyota.quote()                              # same calls as any feed
+# To share this session's market data too, first accept the current policy:
+# briskapi.consent(accept=True, contributor="your-alias", license="CC0-1.0")
+# feed = sbi.connect(codes=["7203"], share_market_data=True)
 ```
 
 Results use the conventions below. Errors are `sbi.SessionExpiredError` (log in
@@ -108,8 +121,9 @@ the `startLive` payload and the catch-up request body. Set them with
 `sbi.connect(profile={...})` and see what the server answers with
 `trace_protocol=True` (every token redacted); until they are right it stops with an
 explicit error rather than guessing. Please report what you see. Your cookies go
-only to sbi.brisk.jp, and SBI market data never leaves your computer. With sharing
-on, a session contributes only a timing summary (see below).
+only to sbi.brisk.jp. SBI market data is shared only after an explicit choice for
+that capture; the Python API requires `share_market_data=True`. With contribution
+on, a timing summary is shared even when market-data sharing is declined.
 
 ## API reference
 
@@ -147,13 +161,20 @@ brisk live --web --codes 7203,6758          # one JSON object per quote update (
 brisk live --sbi --codes 7203               # SBI BRiSK; cookies from BRISK_SBI_COOKIES (JSON); --trace-protocol shows the handshake, wire details in BRISK_SBI_PROFILE
 brisk record --web --output recordings/s1   # record a replay (shared if you agreed)
 brisk list --date 20210927 --source historical_mock
-brisk pull archive/20210927/SHA256 --output recordings/downloaded
+brisk pull PREFIX --output recordings/downloaded   # use a prefix returned by brisk list
 brisk consent [--accept | --revoke]         # show or change sharing
 brisk upload recordings/s1                  # retry sharing a recording
 ```
 
 Each command has `--help`. `pull` verifies everything before writing and never
 overwrites an existing folder.
+
+At the beginning of each interactive `brisk live --sbi` capture with contribution
+enabled, you are asked whether to publish that session's market data; Enter opts
+in. The choice is not saved. Use `--share-market-data` to opt in explicitly in a
+script, or `--no-share-market-data` to decline without prompting. A clean session
+end is required to publish a recording. `brisk list --source sbi_live` lists shared
+SBI recordings; their market content is contributor-declared.
 
 ## Sharing recordings
 
@@ -162,10 +183,13 @@ the tool shows what would be shared and asks once; Enter accepts. After that,
 every complete demo session is uploaded and published automatically. The Python
 API never asks: until you decide, sessions stay on your computer.
 
-- **SBI sessions share timing only:** percentiles of decode time, data age at
+- **SBI timing sharing:** percentiles of decode time, data age at
   receipt and frame spacing, a stall count, the frame count, the trading date,
-  the first and last minute, and your alias and license. Never prices,
-  quantities or codes. `briskapi.Archive().timing()` lists everyone's reports.
+  the first and last minute, and your alias and license.
+  `briskapi.Archive().timing()` lists everyone's reports.
+- **Optional SBI market sharing:** an explicit choice at the start of each capture
+  adds the decoded securities master, prices, quantities, codes and local timing
+  to the public archive. Cookies, tokens and connection diagnostics are excluded.
 - **What a demo session shares:** the market data you recorded, local timing measurements
   (including your computer's clock, which shows when you recorded), and a public
   alias (random `anon-…` by default) and license. Your IP address is used only to

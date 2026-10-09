@@ -115,6 +115,7 @@ class Recording:
         self.manifest = json.loads(manifest.read_text()) if manifest.exists() else None
         self._bootstrap = None
         self._final = None
+        self._last_source_time_us = None
 
     def __repr__(self):
         return f'Recording({str(self.path)!r})'
@@ -147,6 +148,18 @@ class Recording:
         return self.bootstrap['source']
 
     @property
+    def clock_range(self) -> tuple[int, int]:
+        """First and last batch clocks, including empty batches and a clean end."""
+        if self.manifest:
+            last = self.manifest['summary']['last_source_time_us']
+        else:
+            if self._last_source_time_us is None:
+                for batch in self.batches():
+                    self._last_source_time_us = batch['source_time_us']
+            last = self._last_source_time_us
+        return self.bootstrap['source_time_us'], last
+
+    @property
     def codes(self) -> list[str]:
         return [m['code'] for m in self.bootstrap['master']]
 
@@ -168,9 +181,11 @@ class Recording:
             return dict(self._final)
         quotes = {}
         for batch in self.batches():
-            if limit is not None and batch['source_time_us'] > limit:
-                break
-            quotes.update((q['issue_id'], q) for q in batch.get('quotes', ()))
+            # A batch clock bounds its quotes from above, so a later batch can
+            # still contain an update from before the requested quote time.
+            quotes.update((q['issue_id'], q) for q in batch.get('quotes', ())
+                          if limit is None or q['source_time_us'] <= limit)
+            self._last_source_time_us = batch['source_time_us']
         if limit is None:
             self._final = dict(quotes)
         return quotes

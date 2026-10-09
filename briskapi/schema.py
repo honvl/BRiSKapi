@@ -1,9 +1,9 @@
 """Bounded, streaming validation shared by local packaging and automatic ingest.
 
-The archive accepts only byte-canonical recordings whose market content matches a
-pinned reference replay. A modified client can choose a public alias, a data
-license and bounded local timing measurements; it cannot place other content in
-published objects. The service also recompresses accepted content itself.
+The archive accepts byte-canonical recordings with exact market/timing fields.
+Demo and synthetic market content must match a pinned reference replay. Opted-in
+SBI recordings have structural and continuity checks, but their market content
+cannot be independently verified. The service recompresses accepted content itself.
 """
 import datetime as dt
 import gzip
@@ -18,8 +18,9 @@ MAX_COMPRESSED = 64 * 1024 * 1024
 MAX_EXPANDED = 1024 * 1024 * 1024
 MAX_LINE = 16 * 1024 * 1024
 SCHEMA = 'brisk-decoded-jsonl-v1'
-SOURCES = {'historical_mock', 'synthetic_test'}
+SOURCES = {'historical_mock', 'synthetic_test', 'sbi_live'}
 QUOTE_KEYS = set('issue_id code frame source_time_us max_frame last_price10 open_price10 bid_price10 ask_price10 indicative_price10 indicative_volume indicative_side closing_indicative_price10 closing_indicative_volume quote_flag quote_side special_quote_time_us indicative_open_price10 auction_reference_price10 volume issue_status market_buy_quantity market_sell_quantity closing_market_buy_quantity closing_market_sell_quantity'.split())
+SBI_QUOTE_KEYS = QUOTE_KEYS - {'issue_status'}
 MASTER_KEYS = set('issue_id code tick_type base_price10 limit_up10 limit_down10 lot_size issue_type name'.split())
 BATCH_KEYS = {
     'bootstrap': set('type seq source trading_date input_transport source_timestamp_origin exchange_delay_ms source_time_us market_issue_count master quotes'.split()),
@@ -28,6 +29,7 @@ BATCH_KEYS = {
 }
 SUMMARY_KEYS = {'source', 'trading_date', 'first_source_time_us', 'last_source_time_us', 'codes', 'batches', 'quote_updates', 'expanded_bytes'}
 DEMO_ORIGIN = 'https://next-demo.brisk.jp/'
+SBI_TRANSPORT = {'kind': 'sbi_websocket', 'origin': 'https://sbi.brisk.jp/'}
 REFERENCE_DIR = Path(__file__).resolve().parent / 'references'
 # Local measurements are client reported. Plausible ranges and microsecond
 # precision keep them useful as timing data and useless as a payload carrier.
@@ -74,6 +76,12 @@ def canonical_lines(source):
         require(len(line) <= MAX_LINE, 'Recording exceeds decode limit')
         b = json.loads(line, parse_constant=_nonfinite)
         require(isinstance(b, dict), 'Invalid batch')
+        if b.get('type') == 'bootstrap' and b.get('source') == 'sbi_live':
+            transport = b.get('input_transport')
+            if isinstance(transport, dict) and all(transport.get(k) == v for k, v in SBI_TRANSPORT.items()):
+                # Keep only public transport provenance, never session/profile or
+                # decoder paths and connection diagnostics from the local host.
+                b['input_transport'] = dict(SBI_TRANSPORT)
         for key in ('master', 'quotes'):
             if isinstance(b.get(key), list):
                 b[key].sort(key=_issue)
@@ -106,7 +114,10 @@ class Fingerprint:
     def digest(self, issue):
         return self.issues[issue].hexdigest()[:32]
 
-def _transport(value):
+def _transport(value, source):
+    if source == 'sbi_live':
+        require(value == SBI_TRANSPORT, 'Invalid SBI transport fields')
+        return
     require(value == {'kind': 'local_cache'} or (isinstance(value, dict) and set(value) == {'kind', 'origin', 'asset_fetch_ms'}
             and value['kind'] == 'https_recorded_assets' and value['origin'] == DEMO_ORIGIN), 'Invalid transport fields')
     if 'asset_fetch_ms' in value:
@@ -137,7 +148,8 @@ def _scan(stream):
         require(now >= last, 'Market clock regression')
         fingerprint.batch(seq, now)
         if seq == 0:
-            require(kind == 'bootstrap' and b['source'] in SOURCES, 'Unsupported bootstrap/source')
+            require(kind == 'bootstrap' and isinstance(b['source'], str) and b['source'] in SOURCES,
+                    'Unsupported bootstrap/source')
             source, date, first = b['source'], b['trading_date'], now
             require(isinstance(date, str) and re.fullmatch(r'\d{8}', date), 'Invalid date')
             dt.datetime.strptime(date, '%Y%m%d')
@@ -158,7 +170,7 @@ def _scan(stream):
                         integer(value)
                 fingerprint.master(m)
             # No account/session information is retained in the archive.
-            _transport(b['input_transport'])
+            _transport(b['input_transport'], source)
             require(b['source_timestamp_origin'] == 'brisk_decoder_unverified', 'Invalid clock provenance')
             require(b['exchange_delay_ms'] is None, 'Unverified exchange delay')
         else:
@@ -172,6 +184,8 @@ def _scan(stream):
             require(previous_stamp <= stamp <= received + MAX_SESSION_MS, 'Local receipt clock regression/span')
             previous_stamp = stamp
             lateness = b['replay_lateness_ms']
+            if source == 'sbi_live':
+                require(lateness is None, 'SBI streams are not demo replays')
             if lateness is not None:
                 measurement(lateness, MAX_SESSION_MS)
             # A replay is paced (measured) or unpaced (null) throughout.
@@ -181,7 +195,8 @@ def _scan(stream):
         require(isinstance(quotes, list) and len(quotes) <= len(identities), 'Invalid quote count')
         previous_issue = -1
         for q in quotes:
-            require(isinstance(q, dict) and set(q) == QUOTE_KEYS, 'Unknown or missing quote fields')
+            keys = SBI_QUOTE_KEYS if source == 'sbi_live' else QUOTE_KEYS
+            require(isinstance(q, dict) and set(q) == keys, 'Unknown or missing quote fields')
             issue = integer(q['issue_id'], 2**32-1)
             require(issue > previous_issue and identities.get(issue) == code(q['code']), 'Quote identity mismatch/duplicate')
             previous_issue = issue
@@ -196,7 +211,9 @@ def _scan(stream):
         if seq == 0:
             require(len(quotes) == len(identities), 'Incomplete bootstrap')
         if kind == 'end':
-            require(b['frames'] == seq and b['quote_updates'] == updates, 'End summary mismatch')
+            frames = integer(b['frames'])
+            require((frames >= seq - 1 if source == 'sbi_live' else frames == seq)
+                    and integer(b['quote_updates']) == updates, 'End summary mismatch')
             measurement(b['replay_wall_ms'], MAX_SESSION_MS)
             ended = True
         elif kind == 'quotes':
@@ -240,8 +257,16 @@ def load_references():
 REFERENCES = load_references()
 
 def validate_stream(stream, references=None):
-    """Validate a canonical recording against its source's reference replay."""
+    """Validate canonical fields/continuity, plus reference content for demo/synthetic data.
+
+    SBI live content is contributor-declared and has no reference replay. Its
+    quotes omit issue_status (not exported by SBI's decoder), its transport is
+    exactly SBI_TRANSPORT, and replay_lateness_ms must be null. End frames include
+    pre-bootstrap catch-up frames as well as the emitted quote batches.
+    """
     summary, fingerprint, market = _scan(stream)
+    if summary['source'] == 'sbi_live':
+        return summary
     reference = (REFERENCES if references is None else references).get(summary['source'])
     require(reference is not None, 'No reference replay for this source')
     require(summary['trading_date'] == reference['trading_date'] and market == reference['market_issue_count']
@@ -265,16 +290,27 @@ def validate_manifest(m):
     require(m['schema'] == SCHEMA and isinstance(m['sha256'], str) and re.fullmatch('[0-9a-f]{64}', m['sha256']), 'Invalid schema/hash')
     require(0 < integer(m['bytes'], MAX_COMPRESSED), 'Empty upload')
     require(isinstance(m['contributor'], str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', m['contributor']), 'Invalid contributor alias')
-    require(m['license'] in {'CC0-1.0', 'CC-BY-4.0'} and m['redistribution_permitted'] is True, 'Redistribution declaration required')
+    require(isinstance(m['license'], str) and m['license'] in {'CC0-1.0', 'CC-BY-4.0'}
+            and m['redistribution_permitted'] is True, 'Redistribution declaration required')
     summary = m['summary']
-    require(isinstance(summary, dict) and set(summary) == SUMMARY_KEYS and summary['source'] in SOURCES, 'Invalid summary')
+    require(isinstance(summary, dict) and set(summary) == SUMMARY_KEYS and isinstance(summary['source'], str)
+            and summary['source'] in SOURCES, 'Invalid summary')
     require(isinstance(summary['trading_date'], str) and re.fullmatch(r'\d{8}', summary['trading_date']), 'Invalid summary date')
+    dt.datetime.strptime(summary['trading_date'], '%Y%m%d')
     for key in SUMMARY_KEYS - {'source', 'trading_date', 'codes'}:
         integer(summary[key])
     codes = summary['codes']
     require(isinstance(codes, list) and 0 < len(codes) <= 20000, 'Invalid summary codes')
     for value in codes:
         code(value)
+    require(codes == sorted(set(codes)), 'Invalid summary code order/duplicates')
+    first, last = summary['first_source_time_us'], summary['last_source_time_us']
+    require(first <= last < 86_400_000_000 and summary['batches'] >= 2
+            and summary['quote_updates'] >= len(codes) and summary['expanded_bytes'] > 0, 'Invalid summary bounds')
+    reference = REFERENCES.get(summary['source'])
+    if reference:
+        require(summary['trading_date'] == reference['trading_date'] and summary['batches'] == reference['batches'],
+                'Summary is not a complete reference replay')
     return m
 
 def inspect_package(path, manifest, references=None):

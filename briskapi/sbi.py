@@ -15,8 +15,8 @@ pybrisk (https://github.com/obichan117/pybrisk), Copyright (c) 2026 obichan117,
 MIT License; see LICENSE-pybrisk.txt in this package.
 
 Your session cookies are credentials. They are sent only to sbi.brisk.jp and are
-kept in memory unless you pass remember=True. SBI data is never contributed to
-the shared archive.
+kept in memory unless you pass remember=True. Sharing SBI market data requires
+share_market_data=True for that session and contribution consent.
 """
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ class Session:
     """Cookie-authenticated HTTP to sbi.brisk.jp: rate limited, no redirects."""
 
     def __init__(self, cookies, rate_limit=1.0, timeout=30, opener=None):
-        if not cookies:
+        if not cookies or not isinstance(cookies, dict) or not any(cookies.values()):
             raise SessionExpiredError('No SBI BRiSK cookies: copy them from your logged-in browser and call sbi.login()')
         self.cookies = dict(cookies)
         self.rate_limit, self.timeout = rate_limit, timeout
@@ -241,7 +241,8 @@ def _default() -> Client:
     return _client
 
 
-def connect(codes=None, history=False, node='node', timeout=120, contribute=None, trace_protocol=False, profile=None):
+def connect(codes=None, history=False, node='node', timeout=120, contribute=None, trace_protocol=False, profile=None,
+            share_market_data=False):
     """Experimental live SBI BRiSK feed: SBI's own WASM decoder under Node, never Chrome.
 
     Returns a briskapi.Feed (the default source for briskapi.Ticker and Market).
@@ -256,9 +257,11 @@ def connect(codes=None, history=False, node='node', timeout=120, contribute=None
     `trace_protocol=True` prints the connection steps to stderr with every token
     redacted, to see what the server answers. The protocol has not been validated end to
     end against a live session; failures are explicit.
-    Market data never leaves your computer. With sharing on (briskapi.consent), a
-    timing-only summary is contributed when the session ends; contribute=False
-    keeps even that local.
+    With sharing on (briskapi.consent), a timing summary is contributed when the
+    session ends. share_market_data=True additionally publishes the decoded market
+    recording after a clean end, under your saved alias, license and redistribution
+    declaration. It requires current consent; contribute=False or BRISK_CONTRIBUTE=0
+    keeps both local. Cookies, tokens and connection diagnostics are never published.
     """
     from briskapi import load
     from briskapi._live import Feed
@@ -272,7 +275,8 @@ def connect(codes=None, history=False, node='node', timeout=120, contribute=None
     env = {**os.environ, 'BRISK_SBI_COOKIES': json.dumps(session.cookies)}
     if profile:
         env['BRISK_SBI_PROFILE'] = json.dumps(profile)
-    feed = Feed(command=command, env=env, history=history, contribute=contribute, timing='sbi_live')
+    feed = Feed(command=command, env=env, history=history, contribute=contribute, timing='sbi_live',
+                share_market_data=share_market_data)
     try:
         return load(feed.ready(timeout))
     except BaseException:

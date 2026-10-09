@@ -88,21 +88,24 @@ class Feed:
     manifest = None
 
     def __init__(self, web=False, cache=None, codes=None, speed=1, limit_frames=None, contribute=None,
-                 history=False, node='node', *, command=None, env=None, timing=None):
-        # `command` runs another decoder host (SBI live). Its market data is never
-        # contributed; with `timing` set, a timing-only summary may be.
+                 history=False, node='node', *, command=None, env=None, timing=None, share_market_data=False):
+        # SBI market recordings require a separate opt-in for this session.
+        if share_market_data and (command is None or timing != 'sbi_live'):
+            raise BriskError('share_market_data requires an SBI live session')
         cli.check_node(command[0] if command else node)
         if command is None:
             choice, upload = _consent(contribute, limit_frames)
             self._choice, self._timing = (choice if upload else None), None
         else:
-            choice, upload = _consent(contribute, None) if timing else (None, False)
-            self._choice = None
+            choice, upload = _consent(True if share_market_data else contribute, None) if timing else (None, False)
+            upload = upload and contribute is not False
+            self._choice = choice if share_market_data and upload else None
             self._timing = (TimingStats(timing), choice) if upload else None
         self.timing_contribution = None
         self._history = {} if history else None
         self._quotes: dict[int, dict] = {}
         self._bootstrap = None
+        self._last_source_time_us = None
         self._listeners: list = []
         self._changed = threading.Condition()
         self._closing = False
@@ -135,6 +138,13 @@ class Feed:
     @property
     def source(self) -> str:
         return self.bootstrap['source']
+
+    @property
+    def clock_range(self) -> tuple[int, int]:
+        """First and most recently received batch clocks."""
+        self.ready()
+        with self._changed:
+            return self._bootstrap['source_time_us'], self._last_source_time_us
 
     @property
     def codes(self) -> list[str]:
@@ -307,6 +317,7 @@ class Feed:
                 for q in quotes:
                     self._history.setdefault(q['issue_id'], []).append(q)
             self.seq = batch['seq']
+            self._last_source_time_us = batch['source_time_us']
             listeners = list(self._listeners)
             self._changed.notify_all()
         for wanted, deliver, view, _ in listeners:

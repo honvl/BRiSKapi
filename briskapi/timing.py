@@ -1,4 +1,4 @@
-"""Timing-only statistics for sessions whose market data can't be shared (SBI BRiSK)."""
+"""Timing-only statistics shared by default for SBI BRiSK sessions."""
 from __future__ import annotations
 
 import datetime as dt

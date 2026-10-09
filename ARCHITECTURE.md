@@ -25,7 +25,7 @@ events.jsonl ─► canonical package ─► upload ticket ─► S3 staging ─
 
 ## Data source
 
-The only input today is the public BRiSK Next demo dated 2021-09-27. Its
+The account-free input is the public BRiSK Next demo dated 2021-09-27. Its
 initial snapshot is at 08:59:59.999955 JST with 4,131 securities. The frame
 container has 18,001 frames labelled 09:00:00.000–09:02:59.990, so it provides
 one genuine pre-open snapshot and the opening transition, not a pre-open time
@@ -55,6 +55,13 @@ Sequence gaps, clock regressions, malformed input and interruption invalidate a
 stream in the Rust state and in archive validation. The Python feed checks
 sequence continuity and a clean end.
 
+Recording time queries filter each quote by its own `source_time_us`, including
+quotes in batches whose clock is later than the query. Batch clocks are upper
+bounds on contained quote times, so stopping at the first later batch would miss
+valid snapshots and deltas. `Market.summary()` uses the first and last batch
+clocks, including empty batches and the end marker; recordings cache that range
+when no manifest is available, while feeds track it under the state lock.
+
 ## Live feed
 
 `briskapi.Feed` reads decoder output on a background thread and applies each batch
@@ -68,12 +75,17 @@ security.
 
 When sharing is enabled, a demo feed also writes the session to a temporary file.
 After a clean end it packages and uploads the file, then deletes it. SBI feeds
-never share market data; with sharing enabled they accumulate timing statistics
-(`briskapi/timing.py`) and contribute one timing report when they end.
+accumulate timing statistics when sharing is enabled (`briskapi/timing.py`). Market
+recording additionally requires a separate opt-in for that session. The interactive
+CLI asks before starting the decoder (Enter accepts); scripts use
+`--share-market-data` or `sbi.connect(share_market_data=True)`. The per-session
+choice is not persisted. Current consent is required, and `BRISK_CONTRIBUTE=0`
+or `contribute=False` disables both forms of sharing. Only a clean end publishes
+market data; an interrupted capture's temporary file is deleted.
 
 ## Timing reports
 
-SBI market data can't be redistributed, but how the feed behaves can. A report
+A timing report is shared independently of an SBI market-recording opt-in. A report
 (`brisk-timing-v1`) holds p50/p90/p99/max of decode time, feed-clock age at
 receipt and frame spacing, a stall count (gaps over one second), the frame
 count, trading date, first/last JST minute, client version, alias and license.
@@ -185,8 +197,9 @@ published `archive/` and `timing/` objects and list those prefixes over HTTPS. `
 
 ### Integrity
 
-The client is open source, so the service trusts nothing it sends. Only genuine
-replays can be stored, whatever a modified client uploads:
+The client is open source, so the service validates every upload. Demo and
+synthetic content must match a reference; SBI live content has no reference and
+is contributor-declared:
 
 - **Reference replay.** Market content must equal the pinned demo replay.
   [briskapi/references/historical_mock.json](briskapi/references/historical_mock.json) holds a
@@ -194,6 +207,7 @@ replays can be stored, whatever a modified client uploads:
   batch it arrived in) and a hash of the batch clock timeline; it contains no
   market data. Any subset of securities is accepted, but only complete replays.
   `tools/brisk_mock/build_reference.py` regenerates it after a re-audited asset pin.
+  This comparison applies only to demo/synthetic sources, not to `sbi_live`.
 - **Canonical bytes.** Each line must be the one canonical JSON encoding of its
   value: sorted keys, issues in ID order, compact separators, no escapes. Extra
   whitespace, duplicate keys, alternative number spellings and other encoding
@@ -204,6 +218,12 @@ replays can be stored, whatever a modified client uploads:
   rejected. Local timing values must be plausible: decode ≤ 10 s, receipt clock
   monotonic within 24 h, millisecond values with at most microsecond precision,
   and pacing consistent throughout. End-of-stream counts must match.
+  SBI quotes omit `issue_status`, which its decoder does not export, and use null
+  replay lateness. Its end frame count includes pre-bootstrap catch-up frames,
+  so it can exceed the number of emitted quote batches. SBI packaging removes
+  connection/decoder diagnostics and publishes only
+  `{"kind":"sbi_websocket","origin":"https://sbi.brisk.jp/"}` as transport metadata.
+  The service rejects any additional transport fields.
 - **Service-made objects.** The service publishes its own deterministic gzip of
   the validated lines, never the uploaded bytes. Gzip header fields, extra
   members, padding and deflate choices therefore cannot carry data.
@@ -214,9 +234,11 @@ replays can be stored, whatever a modified client uploads:
 - **Malformed input.** Corrupt deflate data and deeply nested JSON are rejected
   like any other invalid upload.
 
-A client still chooses its alias (up to 64 characters), its license and bounded
-timing measurements. These can't be verified, so a small, rate-limited amount of
-free-form capacity remains per recording.
+A client chooses its alias (up to 64 characters), its license and bounded timing
+measurements. These cannot be verified. SBI master names and market values also
+remain unverified contributor content; exact fields and canonical encoding do
+not establish market accuracy or redistribution permission. Upload quotas apply
+to every source.
 
 ### Publication and limits
 
@@ -232,17 +254,22 @@ free-form capacity remains per recording.
   complete replay is about 34 MB compressed.
 - Ticket metadata in staging expires after two days. Published data is retained.
 - `pull` checks compressed size, SHA-256, the complete stream, the manifest and
-  the reference replay, then moves the folder into place atomically.
+  the reference replay where available, then moves the folder into place atomically.
+  Manifest validation and archive identity checks precede payload download.
+  Listings warn and skip invalid/unsupported manifests, including old probes
+  with incomplete reference metadata, without hiding S3/network failures.
 
 ### Sources
 
-The schema accepts `historical_mock` and `synthetic_test`. The archive therefore
-also contains a small, self-authored `synthetic_test` fixture used to verify
-publication; filter by source when selecting market data. Live or raw-wire
-submissions would need an explicit schema and transport extension, including
-bootstrap and timestamp provenance. They would also need a new trust model,
-because there is no reference replay to compare live data against. They are
-never silently treated as demo data.
+The decoded schema accepts `historical_mock`, `synthetic_test` and `sbi_live`.
+The small, self-authored `synthetic_test` fixture verifies publication; filter by
+source when selecting market data. Opted-in decoded SBI recordings retain
+`source=sbi_live` and undergo canonical-field, integrity and continuity checks.
+Their market accuracy and redistribution permission are contributor-declared;
+they are not silently treated as reference-verified demo data. New raw-wire
+submissions remain unsupported. The existing legacy wire capture is labeled
+`sample_data`, with schema `brisk-sbi-wire-jsonl-v1`, for protocol research. It is
+separate from the validated decoded-recording catalog and retains its own manifest.
 
 ## Development and deployment
 
