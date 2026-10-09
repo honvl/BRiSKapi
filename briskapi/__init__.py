@@ -18,7 +18,7 @@ from briskapi._live import Feed, connect as _connect, record as _record, stream
 from briskapi._market import Market, Ticker
 from briskapi._recording import JST, BriskError, NotFoundError, Recording, Table
 
-__version__ = '0.4.0'
+__version__ = '0.5.0'
 __all__ = ['JST', 'Archive', 'BriskError', 'Feed', 'Market', 'NotFoundError', 'Recording', 'Table', 'Ticker',
            'connect', 'consent', 'current', 'load', 'pull', 'record', 'recordings', 'stream']
 
