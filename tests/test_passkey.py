@@ -189,12 +189,23 @@ def test_login_signs_in_saves_the_advanced_passkey_and_uses_the_cookies(tmp_path
     assert seen['argv'] == ['login'], 'nothing but the mode may be on the command line'
     request = seen['request']
     assert request['credential'] == PASSKEY and request['mode'] == 'login'
-    assert {k: request[k] for k in ('loginUrl', 'launchUrl', 'passkeyButton', 'headless', 'chrome', 'profileDir')} == {
+    assert {k: request[k] for k in ('loginUrl', 'launchUrl', 'passkeyButton', 'headless', 'chrome', 'profileDir', 'cookieHost')} == {
         'loginUrl': 'https://x.example/login', 'launchUrl': 'https://x.example/brisk', 'passkeyButton': 'Passkey',
-        'headless': True, 'chrome': '/opt/chrome', 'profileDir': str(tmp_path / 'profile')}
+        'headless': True, 'chrome': '/opt/chrome', 'profileDir': str(tmp_path / 'profile'), 'cookieHost': 'sbi.brisk.jp'}
     cookie_file = tmp_path / 'config' / 'brisk' / 'sbi-cookies.json'
     assert json.loads(cookie_file.read_text()) == {'session_x': 'cookie-value', 'other': 'o'}
     assert stat.S_IMODE(cookie_file.stat().st_mode) == 0o600
+
+
+def test_cookies_of_another_site_are_never_given_to_the_sbi_client(tmp_path, helper):
+    log = helper('login-ok')
+    store = saved(tmp_path)
+    for host in ('matsui.example', 'brisk.jp', 'sbi.brisk.jp.evil.example'):
+        with pytest.raises(passkey.PasskeyError, match=r'never given to the SBI client, which only talks to sbi\.brisk\.jp'):
+            passkey.login(store=store, cookie_host=host)
+    assert not log.exists(), 'the refusal must come before Chrome is started'
+    assert store.load() == PASSKEY, 'no sign-in happened, so the counter is unchanged'
+    assert passkey.login(store=store, cookie_host='sbi.brisk.jp', remember=False).session.cookies['session_x'] == 'cookie-value'
 
 
 def test_login_without_remember_keeps_the_cookies_in_memory(tmp_path, helper):
@@ -376,7 +387,8 @@ def chrome_available():
 
 
 @pytest.mark.skipif(shutil.which('node') is None or not chrome_available(), reason='needs Node and Chrome')
-def test_full_stack_enroll_then_login_against_a_fake_sbi(tmp_path):
+def test_full_stack_enroll_then_login_against_a_fake_sbi(tmp_path, monkeypatch):
+    monkeypatch.setattr(sbi, 'ORIGIN', 'https://brisk.localhost')
     site = subprocess.Popen(['node', str(REPO / 'tools' / 'brisk_mock' / 'fake_sbi_passkey.cjs')], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, text=True)
     try:
@@ -399,8 +411,7 @@ def test_full_stack_enroll_then_login_against_a_fake_sbi(tmp_path):
         enrolled = store.load()
         assert enrolled['privateKey'] and enrolled['isResidentCredential'] is True
 
-        client = passkey.login(store=store, login_url=origins['mainOrigin'] + '/login', cookie_host='brisk.localhost',
-                               headless=True, remember=False)
+        client = passkey.login(store=store, login_url=origins['mainOrigin'] + '/login', headless=True, remember=False)
         seen = state()
         assert client.session.cookies['session_fake'] == seen['briskCookieValue']
         assert 'main_session' not in client.session.cookies
@@ -408,8 +419,7 @@ def test_full_stack_enroll_then_login_against_a_fake_sbi(tmp_path):
         assert store.load()['signCount'] > enrolled['signCount']
         assert store.load()['signCount'] == seen['counter'], 'the saved counter must be the one the site last saw'
 
-        second = passkey.login(store=store, login_url=origins['mainOrigin'] + '/login', cookie_host='brisk.localhost',
-                               headless=True, remember=False)
+        second = passkey.login(store=store, login_url=origins['mainOrigin'] + '/login', headless=True, remember=False)
         assert state()['accepted'] == 2 and second.session.cookies['session_fake'] == state()['briskCookieValue']
     finally:
         site.stdin.close()

@@ -28,6 +28,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import urllib.parse
 
 from briskapi._recording import BriskError
 
@@ -199,11 +200,15 @@ def login(remember=True, login_url=None, launch_url=None, passkey_button=None, c
           headless=False, store=None, node='node'):
     """Sign in with the saved passkey and use the BRiSK session cookies (as sbi.login). Returns the client."""
     from briskapi import sbi
+    # The SBI client sends its cookies to one host. Cookies of any other site must never be handed to it.
+    host = urllib.parse.urlsplit(sbi.ORIGIN).hostname
+    if cookie_host not in (None, host):
+        raise PasskeyError(f'Cookies of {cookie_host} are never given to the SBI client, which only talks to {host}')
     store = store or default_store()
     credential = store.load()
     if credential is None:
         raise PasskeyError('No passkey is saved. Run `brisk sbi enroll` first')
-    request = _request(login_url=login_url, launch_url=launch_url, passkey_button=passkey_button, cookie_host=cookie_host,
+    request = _request(login_url=login_url, launch_url=launch_url, passkey_button=passkey_button, cookie_host=host,
                        chrome=chrome, profile_dir=profile_dir, headless=headless or None)
     result = _run('login', {**request, 'credential': credential}, node, on_credential=store.save)
     return sbi.login(cookies=result['cookies'], remember=remember)

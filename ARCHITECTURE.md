@@ -209,7 +209,9 @@ HID device needs an entitlement that Apple grants on request.
    wins, so a "can't sign in?" link does not) and waits for `credentialAsserted`. Then it opens
    `launchUrl` when given, or waits for the person to open BRiSK, and polls for a cookie that
    starts with `cookiePrefix` on exactly the BRiSK host. Only that host's cookies are returned,
-   never those of the main SBI site, whose session is destroyed with the profile.
+   never those of the main SBI site, whose session is destroyed with the profile. The host is
+   always the one the SBI client talks to (`sbi.ORIGIN`); `passkey.login` refuses any other
+   `cookie_host` before Chrome starts, because the client would send those cookies to SBI.
 
 The sign counter is the delicate part. A relying party may reject an assertion whose counter
 does not exceed the last it saw, as a sign of a cloned authenticator, and every sign-in
