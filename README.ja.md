@@ -115,6 +115,31 @@ toyota.quote()                              # 他のフィードと同じ呼び�
 必要）、`briskapi.NotFoundError`、`sbi.RateLimitError`、`sbi.APIError` です。
 リクエストは1秒に1回までに制限しています。
 
+### パスキーでのサインイン（試験的）
+
+SBI証券の口座でパスキーを使っている場合、Cookie をコピーする代わりに `briskapi` が
+サインインできます。Chrome、Node 22 以上、そしてパスキーの保管先として macOS の
+キーチェーンが必要です。Chrome は仮想オーセンティケーターを備えて起動され、一度だけ
+登録したパスキーを保持して、SBI のサインインにタッチなしで応答します。
+
+```sh
+brisk sbi enroll   # 初回のみ: Chrome の画面で手動サインインし、SBI のセキュリティ設定でパスキーを登録。
+                   # 登録完了の表示が出たら Enter を押す
+brisk sbi login    # 毎回: Chrome がサインインし、`brisk live --sbi` 用に BRiSK の Cookie を保存
+brisk sbi forget   # 保存したパスキーを削除（SBI の設定でも削除してください）
+```
+
+Python では `sbi.passkey_login()` が `sbi.login(cookies=...)` と同じ働きをし、クライアントを
+返します。パスキーは認証情報です。持っている人は誰でも SBI の口座にサインインできます。
+パスキーはキーチェーンにのみ保存され（`BRISK_PASSKEY_STORE=file` なら本人のみ読み取り可の
+ファイルに保存しますが、安全性は下がります）、お使いのマシンの外には出ず、ログにも表示
+されません。`--launch-url` を指定しない場合は、サインイン後に Chrome の画面で SBI のサイトから
+BRiSK を開きます。SBI のサインインページと BRiSK の起動は実際の口座では未検証のため、
+`--login-url`、`--passkey-button`、`--launch-url` で上書きできます。うまくいかない点は
+ぜひお知らせください。Chrome は自動操作されていることをサイトに伝えるため、SBI に拒否される
+可能性があります。利用前に、SBI の規約でこの使い方が認められているかご確認ください。
+詳細は [ARCHITECTURE.md](https://github.com/honvl/BRiSKapi/blob/main/ARCHITECTURE.md#passkey-sign-in) を参照してください。
+
 ライブフィードは、ご自身のセッションでダウンロードした SBI 自身のデコーダーを
 Node 上で動かします。ブラウザは使いません。ベンダーのクライアントと同じ接続手順
 （最初のフレームからデコーダーに入力し、スナップショットをストリームに追いつかせ、
@@ -148,7 +173,7 @@ Node 上で動かします。ブラウザは使いません。ベンダーのク
 | `briskapi.consent(...)` | 共有の設定 |
 | `Ticker(code).candles(interval)` / `.margin(days)` | SBI BRiSK のローソク足、信用残と貸株料 |
 | `Market().turnover()` / `.lists()` / `.events()` / `.schedule()` / `.watchlist()` | SBI BRiSK の市場データ |
-| `briskapi.sbi.login()` / `.connect()` | SBI BRiSK のセッションとライブフィード |
+| `briskapi.sbi.login()` / `.passkey_login()` / `.connect()` | SBI BRiSK のセッション（Cookie またはパスキー）とライブフィード |
 
 価格は円単位の浮動小数点数で、ベンダーの「値なし」（0）は `None` になります。
 時刻は取引日の日本時間の `datetime` です。数量は株数で、売買区分・フラグ・
@@ -162,6 +187,7 @@ Node 上で動かします。ブラウザは使いません。ベンダーのク
 
 ```sh
 brisk live --web --codes 7203,6758          # 気配の更新ごとに JSON を1行出力（--raw でベンダー形式）
+brisk sbi enroll | login | forget          # Chrome 経由のパスキーでの SBI サインイン（試験的）
 brisk live --sbi --codes 7203               # SBI BRiSK。Cookie は BRISK_SBI_COOKIES（JSON）から。--trace-protocol で接続手順を表示（通信の詳細は BRISK_SBI_PROFILE）
 brisk record --web --output recordings/s1   # デモを記録（同意済みなら共有）
 brisk list --date 20210927 --source historical_mock

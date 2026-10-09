@@ -32,6 +32,7 @@ import urllib.request
 import zlib
 
 from briskapi._recording import JST, BriskError, NotFoundError, Table
+from briskapi.passkey import PasskeyError  # noqa: F401  (part of this module's API)
 
 ORIGIN = 'https://sbi.brisk.jp'
 DECODER = Path(__file__).resolve().parent / 'decoder' / 'sbi.cjs'
@@ -79,7 +80,8 @@ class Session:
 
     def __init__(self, cookies, rate_limit=1.0, timeout=30, opener=None):
         if not cookies or not isinstance(cookies, dict) or not any(cookies.values()):
-            raise SessionExpiredError('No SBI BRiSK cookies: copy them from your logged-in browser and call sbi.login()')
+            raise SessionExpiredError('No SBI BRiSK cookies: copy them from your logged-in browser and call sbi.login(), '
+                                      'or run `brisk sbi login` (passkey)')
         self.cookies = dict(cookies)
         self.rate_limit, self.timeout = rate_limit, timeout
         self.token = None
@@ -226,6 +228,24 @@ def login(cookies=None, remember=False) -> Client:
         with os.fdopen(fd, 'w') as f:
             json.dump(_client.session.cookies, f)
     return _client
+
+
+def passkey_enroll(**options):
+    """Capture the passkey you register at SBI in a Chrome window (once). See briskapi.passkey."""
+    from briskapi import passkey
+    return passkey.enroll(**options)
+
+
+def passkey_login(**options) -> Client:
+    """Sign in with the saved passkey in Chrome and use the BRiSK cookies, as login(). See briskapi.passkey."""
+    from briskapi import passkey
+    return passkey.login(**options)
+
+
+def passkey_forget(**options):
+    """Delete the saved passkey (it stays registered at SBI until you remove it there)."""
+    from briskapi import passkey
+    return passkey.forget(**options)
 
 
 def logout():

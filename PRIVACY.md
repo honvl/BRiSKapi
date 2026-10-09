@@ -69,7 +69,7 @@ or email address unless you want it public.
 ## What is never collected
 
 The tool sends nothing about brokerage or BRiSK accounts, cookies, session tokens,
-orders, usernames, hostnames, file paths, environment variables or hardware
+passkeys, orders, usernames, hostnames, file paths, environment variables or hardware
 identifiers. The archive service accepts only the fields listed above and rejects
 any recording that contains other fields. SBI market content and redistribution
 permission are supplied by the contributor and cannot be independently verified.
@@ -85,6 +85,15 @@ from your own browser. They are credentials:
   them to `~/.config/brisk/sbi-cookies.json` (or `$XDG_CONFIG_HOME/brisk/`),
   readable only by you. `sbi.logout()` deletes that file.
 - The live host receives them through its environment, not its command line.
+- `brisk sbi enroll` / `brisk sbi login` (passkey sign-in) capture a passkey that you
+  register at SBI and use it to obtain these cookies. The passkey's private key is a
+  credential that lets whoever has it sign in to your SBI account. It is kept only in
+  the macOS Keychain (or, if you set `BRISK_PASSKEY_STORE=file`, in an owner-only file
+  under `~/.config/brisk/`), is passed to the sign-in helper over stdin and never on a
+  command line, and is never logged, uploaded or included in any recording.
+  `brisk sbi forget` deletes it here; remove it in SBI's settings as well. The Chrome
+  profile used for sign-in is temporary and deleted afterwards, and only the BRiSK
+  host's cookies are taken from it.
 - SBI market data is published only after an explicit opt-in at the start of that
   capture (Enter accepts the interactive question), `--share-market-data`, or
   `sbi.connect(share_market_data=True)`, together with current contribution consent.

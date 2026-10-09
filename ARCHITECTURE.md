@@ -175,6 +175,71 @@ stream that never initializes, a refused namespace, a rejected catch-up, an
 implausible stock view or master) rather than guessed data. Not implemented: reconnecting.
 The feed fails and needs a restart.
 
+### Passkey sign-in
+
+`briskapi.passkey` (CLI: `brisk sbi enroll | login | forget`) gets the session cookies by
+signing in to SBI with a passkey, in place of copying them from a browser. SBI's passkeys
+are WebAuthn credentials whose private key lives in the user's authenticator, so the host
+supplies one: Chrome's DevTools `WebAuthn` domain provides a virtual authenticator that
+signs without a touch, and can export and import a credential. Passless-style virtual USB
+devices were ruled out: they need `/dev/uhid` (Linux only), and on macOS creating a virtual
+HID device needs an entitlement that Apple grants on request.
+
+`decoder/passkey.cjs` runs under Node and drives a Chrome it starts itself.
+
+1. **Private pipe, no port.** Chrome is started with `--remote-debugging-pipe` and talked to
+   over file descriptors 3 and 4 (NUL-framed JSON). A loopback debugging port would let any
+   local process attach and read the passkey back out with `WebAuthn.getCredentials`.
+2. **Ephemeral profile.** The profile is a new private directory, deleted when Chrome exits
+   (`--profile-dir` opts into a persistent one). The mock keychain and basic password store
+   keep Chrome from prompting for Keychain access. Chrome reports `navigator.webdriver` as
+   true whenever DevTools is attached (checked in both modes), and headless Chrome's user
+   agent says so too, so a site that blocks automated browsers can tell. The host does not
+   hide this. The default is a visible window, which lets a person take over where a guess
+   about SBI's pages is wrong or SBI refuses the automation.
+3. **A virtual authenticator on every page**, including popups and new tabs
+   (`Target.setAutoAttach`). It is a CTAP2.1 platform authenticator with resident keys that
+   approves presence and verification itself.
+4. **Enrolling** attaches an empty authenticator, opens the login page and waits for
+   `WebAuthn.credentialAdded` while the person registers a passkey. The captured credential is
+   kept in memory and saved only after the person confirms, so a failed enrollment never
+   replaces a passkey that still works. `enroll` refuses to overwrite without `--replace`.
+5. **Signing in** imports the saved credential, opens the login page, clicks the control whose
+   text contains `passkeyButton` (trusted `Input` mouse events; the shortest matching label
+   wins, so a "can't sign in?" link does not) and waits for `credentialAsserted`. Then it opens
+   `launchUrl` when given, or waits for the person to open BRiSK, and polls for a cookie that
+   starts with `cookiePrefix` on exactly the BRiSK host. Only that host's cookies are returned,
+   never those of the main SBI site, whose session is destroyed with the profile.
+
+The sign counter is the delicate part. A relying party may reject an assertion whose counter
+does not exceed the last it saw, as a sign of a cloned authenticator, and every sign-in
+advances it. The host therefore streams the credential as JSON lines after every change, the
+Python side saves each one at once, and a failed or interrupted run still reports the
+latest. If a save fails, the helper is stopped rather than allowed to sign in again with a
+counter that would no longer match.
+
+Secrets move only over stdin and stdout, never on a command line or in a log message (logs
+name origins, never paths or queries, and the helper refuses to run attached to a terminal).
+The passkey is kept in the macOS Keychain through `security -i`, which reads its command from
+stdin: `add-generic-password -w SECRET` would show the secret in the process list. `security`
+exits 0 even when a write fails, so each write is read back and compared. Without a Keychain
+(not macOS) the passkey is stored only if `BRISK_PASSKEY_STORE=file` asks for an owner-only
+file, which is weaker. The private key is the whole credential: whoever has it can sign in.
+
+Tests run Chrome against a fake SBI (`tools/brisk_mock/fake_sbi_passkey.cjs`) that verifies
+what a real site verifies: the ES256 signature, the relying-party hash, user presence and
+verification, and a counter that must increase. They cover enroll, sign-in, a stale passkey
+being refused as a clone, `launchUrl`, a missing passkey control and that nothing secret is
+logged. They skip when Chrome is absent.
+
+What is not verified against SBI itself: the login URL (`login.sbisec.co.jp/login/entry`;
+it redirected to a maintenance page when checked), the passkey control's text, how BRiSK is
+launched from the main site, whether SBI accepts a virtual authenticator at registration or
+asks for more identity checks, whether it refuses an automated Chrome (see above), and how
+long the BRiSK cookie lasts. Each is an overridable default or a manual step, and a wrong
+guess ends in an explicit error. The DevTools `WebAuthn` domain is marked experimental.
+Windows is not supported.
+
 ## Reconstructing a recording
 
 To validate and reconstruct a saved or downloaded recording with the Rust state

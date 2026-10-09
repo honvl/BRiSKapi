@@ -111,6 +111,29 @@ Results use the conventions below. Errors are `sbi.SessionExpiredError` (log in
 again), `briskapi.NotFoundError`, `sbi.RateLimitError` and `sbi.APIError`.
 Requests are limited to one per second.
 
+### Signing in with a passkey (experimental)
+
+If your SBI account uses a passkey, `briskapi` can sign in for you instead of you
+copying cookies. It needs Chrome, Node 22+ and, to keep the passkey, the macOS
+Keychain. Chrome runs with a built-in virtual authenticator that holds the passkey
+you register once, and answers SBI's sign-in without a touch.
+
+```sh
+brisk sbi enroll   # once: sign in by hand in the Chrome window and register a passkey in SBI's
+                   # security settings; press Enter when SBI says it is registered
+brisk sbi login    # each session: Chrome signs in and the BRiSK cookies are kept for `brisk live --sbi`
+brisk sbi forget   # delete the saved passkey (remove it in SBI's settings too)
+```
+
+From Python, `sbi.passkey_login()` does the same as `sbi.login(cookies=...)` and returns the
+client. The passkey is a credential: whoever has it can sign in to your SBI account. It is
+kept only in the Keychain (`BRISK_PASSKEY_STORE=file` keeps it in an owner-only file instead,
+which is weaker), never leaves your machine, and is never shown in a log. Without `--launch-url`
+you open BRiSK from the SBI site in the Chrome window after it signs you in. SBI's sign-in page
+and BRiSK launch haven't been verified against a live account, so `--login-url`,
+`--passkey-button` and `--launch-url` are overridable; please report what fails. Chrome tells the site
+it is being automated, so SBI may refuse it. Check that SBI's terms allow this before relying on it. See [ARCHITECTURE.md](https://github.com/honvl/BRiSKapi/blob/main/ARCHITECTURE.md#passkey-sign-in).
+
 The live feed runs SBI's own decoder under Node, downloaded with your session;
 no browser is involved. It follows the vendor client's connect sequence: it feeds
 the decoder from the first frame, catches the snapshot up to the stream, forwards
@@ -144,7 +167,7 @@ on, a timing summary is shared even when market-data sharing is declined.
 | `briskapi.consent(...)` | Your sharing choice |
 | `Ticker(code).candles(interval)` / `.margin(days)` | SBI BRiSK price bars; margin balances and lending fees |
 | `Market().turnover()` / `.lists()` / `.events()` / `.schedule()` / `.watchlist()` | SBI BRiSK market data |
-| `briskapi.sbi.login()` / `.connect()` | SBI BRiSK session and live feed |
+| `briskapi.sbi.login()` / `.passkey_login()` / `.connect()` | SBI BRiSK session (cookies or passkey) and live feed |
 
 Prices are yen floats, with `None` for the vendor's zero "unavailable" value.
 Times are JST `datetime`s on the trading date. Quantities are shares; side, flag
@@ -158,6 +181,7 @@ recording once (about six seconds for the complete 420 MB demo).
 
 ```sh
 brisk live --web --codes 7203,6758          # one JSON object per quote update (--raw for vendor fields)
+brisk sbi enroll | login | forget          # SBI sign-in with a passkey through Chrome (experimental)
 brisk live --sbi --codes 7203               # SBI BRiSK; cookies from BRISK_SBI_COOKIES (JSON); --trace-protocol shows the handshake, wire details in BRISK_SBI_PROFILE
 brisk record --web --output recordings/s1   # record a replay (shared if you agreed)
 brisk list --date 20210927 --source historical_mock
