@@ -25,6 +25,7 @@ signing in captures the BRiSK session cookies for your own use.
 """
 from __future__ import annotations
 
+import codecs
 from dataclasses import dataclass, replace
 import json
 import os
@@ -104,6 +105,17 @@ def _entry(raw, where):
     return site_id, {key: value for key, value in raw.items() if key != 'id'}
 
 
+def _read_text(path):
+    """The text of a file you may have edited on Windows: UTF-8 (the usual case), UTF-8 with the byte-order
+    mark that Notepad and PowerShell 5.1's `-Encoding utf8` write, or the UTF-16 that its `>` and `Out-File` write.
+    Never the system code page: the button texts are Japanese."""
+    data = path.read_bytes()
+    for mark, codec in ((codecs.BOM_UTF8, 'utf-8-sig'), (codecs.BOM_UTF16_LE, 'utf-16'), (codecs.BOM_UTF16_BE, 'utf-16')):
+        if data.startswith(mark):
+            return data.decode(codec)
+    return data.decode('utf-8')
+
+
 def load_sites(path=None) -> dict:
     """The built-in sites, plus or edited by the entries in sites.json."""
     path = Path(path) if path else sites_path()
@@ -111,9 +123,9 @@ def load_sites(path=None) -> dict:
     if not path.exists():
         return sites
     try:
-        raw = json.loads(path.read_text(encoding='utf-8'))  # button texts are Japanese; never the system code page
+        raw = json.loads(_read_text(path))
     except ValueError as error:
-        raise SiteError(f'{path} is not valid JSON ({error})') from error
+        raise SiteError(f'{path} is not valid JSON text ({error})') from error
     entries = raw.get('sites') if isinstance(raw, dict) else None
     if not isinstance(entries, list):
         raise SiteError(f'{path} must be an object with a "sites" list')

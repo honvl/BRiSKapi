@@ -270,7 +270,8 @@ closes it first and terminates only if the helper does not exit within `GRACE` (
 longer than closing Chrome and deleting its profile can take. (Killing the helper outright does make
 Chrome exit on its own within about a second on Windows, because its pipe closes.) Text between
 Python and Node is always UTF-8, because Python's default there is the system code page (cp1252) and a
-Japanese user name or button text would fail to decode. And deleting the temporary profile retries,
+Japanese user name or button text would fail to decode; `sites.json` is read as UTF-8 and also accepts
+the byte-order mark and the UTF-16 that Windows editors and PowerShell 5.1 write. And deleting the temporary profile retries,
 because Windows can keep a file locked for a moment after Chrome exits.
 
 Tests run Chrome against a fake broker (`tools/brisk_mock/fake_sbi_passkey.cjs`) that verifies
@@ -286,9 +287,16 @@ text, how BRiSK is launched from the main site, the name of the BRiSK session co
 known, so the other sites accept any cookie on their BRiSK host once it appears), whether a broker
 accepts a virtual authenticator at registration or asks for more identity checks, whether it refuses
 an automated Chrome (see above), and how long the cookie lasts. Each is an overridable default or a
-manual step, and a wrong guess ends in an explicit error. The visible Chrome window of `enroll` and
-`login` was tried on macOS only; the Windows runs were headless. The DevTools `WebAuthn` domain is
-marked experimental.
+manual step, and a wrong guess ends in an explicit error. The automated runs on Windows are headless; the
+visible Chrome window of `enroll` and `login` was also tried by hand on Windows 11 (the real console
+prompt, Credential Manager) and on macOS. The DevTools `WebAuthn` domain is marked experimental.
+
+The mechanism itself is verified against a real site that is not a broker, webauthn.io (a public passkey
+demo; it logs you in on load when a passkey is present, which `login` catches because it listens before
+loading the page): registration through the virtual authenticator, `brisk login` with its cookie and the
+advancing sign counter, on macOS and by hand on Windows. A `sites.json` entry for it needs only
+`login_url` `https://webauthn.io/`, `cookie_host` `webauthn.io`, `passkey_button` `Authenticate` and
+`cookie_prefix` `sessionid`.
 
 ## Reconstructing a recording
 

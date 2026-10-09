@@ -1,4 +1,5 @@
 """The list of BRiSK sites you can sign in to: built-in brokers and your own sites.json."""
+import codecs
 import json
 from urllib.parse import urlsplit
 
@@ -63,6 +64,25 @@ def test_a_built_in_site_is_edited_by_giving_only_the_keys_that_change(tmp_path)
     assert edited.cookie_host == 'matsui.brisk.jp' and edited.name == 'Matsui Securities' and edited.source == 'sites.json'
     sbi = sites.load_sites(write(tmp_path, {'sites': [{'id': 'sbi', 'cookie_host': 'other.example'}]}))['sbi']
     assert sbi.client == 'sbi', 'editing a site must not remove its data client; the host guard handles the mismatch'
+
+
+@pytest.mark.parametrize('encoding', ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16-be-with-mark'])
+def test_a_sites_file_is_read_whichever_way_a_windows_editor_saved_it(tmp_path, encoding):
+    # utf-8-sig: Notepad and PowerShell 5.1 `-Encoding utf8`. utf-16: PowerShell 5.1 `>` and `Out-File`.
+    text = json.dumps({'sites': [{'id': 'matsui', 'passkey_button': 'パスキーで安全にログイン'}]}, ensure_ascii=False)
+    path = tmp_path / 'sites.json'
+    data = codecs.BOM_UTF16_BE + text.encode('utf-16-be') if encoding == 'utf-16-be-with-mark' else text.encode(encoding)
+    path.write_bytes(data)
+    assert data.startswith({'utf-8': b'{', 'utf-8-sig': codecs.BOM_UTF8, 'utf-16': codecs.BOM_UTF16_LE,
+                            'utf-16-be-with-mark': codecs.BOM_UTF16_BE}[encoding]), 'the fixture must carry the mark it claims'
+    assert sites.load_sites(path)['matsui'].passkey_button == 'パスキーで安全にログイン'
+
+
+def test_a_sites_file_that_is_not_text_is_refused_clearly(tmp_path):
+    path = tmp_path / 'sites.json'
+    path.write_bytes(b'\xff\xfe\x00\x00 not utf-16 or utf-8 \x81\x8d')
+    with pytest.raises(sites.SiteError, match='is not valid JSON text'):
+        sites.load_sites(path)
 
 
 @pytest.mark.parametrize('document, message', [
