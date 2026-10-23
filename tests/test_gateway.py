@@ -898,6 +898,25 @@ def test_latest_answers_the_other_quote_schemas_and_refuses_what_is_not_a_quote(
     gateway.close()
 
 
+def test_latest_before_the_day_begins_has_no_rows_in_every_quote_schema():
+    # A Live session that connected before the day's bootstrap asked for imbalance records, and the gateway's thread for it
+    # died projecting them without the day's equity table (AttributeError: 'NoneType' object has no attribute 'column').
+    gateway = _gateway.Gateway('XTKS.BRISK')
+    live = brisk.Live()
+    live.subscribe('XTKS.BRISK', 'imbalance', symbols=['7203'], stream=False)
+    live.start()
+    wait_for(lambda: gateway._clients and gateway._clients[0].codes)
+    for schema, column in (('imbalance', 'upper_collar'), ('mbp-10', 'bid_px_00'), ('brisk-quotes', 'last_price')):
+        table = live.latest(schema)
+        assert table.num_rows == 0 and column in table.schema.names, schema
+    batches = session(0, 3)
+    gateway.publish(batches[0], _line_of(batches[0]))
+    for b in batches[1:-1]:
+        gateway.publish(b, _line_of(b))
+    assert live.latest('mbp-10').num_rows == 1, 'the same session reads the day once it begins'
+    gateway.close()
+
+
 def test_a_session_either_streams_or_keeps_quotes_for_latest_and_latest_needs_a_running_session():
     live = brisk.Live()
     with pytest.raises(brisk.BriskError, match='Start the session'):

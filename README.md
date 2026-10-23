@@ -125,6 +125,12 @@ completed part brings its recording to 80 million quote rows. The demo's replay 
   start a feed; for a host that doesn't end within 30 seconds of being asked to stop, right away.
   The repaired end counts the day's quote updates exactly; its frame count and duration, which
   died with the host, are rebuilt from the recording.
+- **A save that fails** keeps what it can. A recording whose upload failed is kept in
+  `~/.local/share/brisk/recordings` with its manifest, and `brisk upload DIR` retries. One that could not
+  be packaged is tried again five minutes later from the same data, three times during the day and once
+  more at its end; its tables are kept there if even that fails. If nothing of a day could be saved,
+  its spool folder is left in place, with a warning naming it, and the next feed you start finishes it
+  (delete the folder to give the day up).
 
 ## Live feed
 

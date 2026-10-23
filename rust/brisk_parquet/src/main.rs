@@ -2,12 +2,15 @@
 //!
 //!     brisk-parquet verify DIRECTORY [--row-group ROWS] [--threads N] [--format FORMAT]
 //!     brisk-parquet package --spool DIR --midnight NS --out DIR [--day-start PART] [--cut-state FILE --cut-clock US]
-//!                           [--end parts|cut|repair] [--state-out FILE] [--threads N] [--range-rows N] PART...
-//!     brisk-parquet state --spool DIR --midnight NS --state-out FILE [--cut-state FILE --cut-clock US] [--day-start PART] PART...
+//!                           [--end parts|cut|repair] [--state-out FILE] [--threads N] [--range-rows N] [--parts-file FILE] [PART...]
+//!     brisk-parquet state --spool DIR --midnight NS --state-out FILE [--cut-state FILE --cut-clock US] [--day-start PART]
+//!                         [--parts-file FILE] [PART...]
 //!     brisk-parquet part --out DIR --midnight NS [--threads N]    (the decoder's JSON lines on stdin)
 //!     brisk-parquet schemas DIRECTORY
 //!
-//! Each prints a JSON result on stdout, and `progress: ...` lines on stderr (`verify`: the table it checks; `package`: its stage,
+//! The parts of `package` and `state` are those `--parts-file` names (one path per line, UTF-8; `-` reads them from stdin), then
+//! the positional ones: a day has thousands, more than a Windows command line holds (32,767 characters), so briskapi sends them
+//! on stdin. Each prints a JSON result on stdout, and `progress: ...` lines on stderr (`verify`: the table it checks; `package`: its stage,
 //! `package: preparing|finalizing`, and the rows written of a table, `package: batches|quotes|trades DONE/TOTAL`). A recording
 //! that breaks a rule exits 2 with `refused: MESSAGE` on stderr; any other failure exits 1.
 use std::collections::HashMap;
@@ -17,6 +20,7 @@ use std::process::ExitCode;
 use brisk_parquet::error::{Failure, Res};
 use brisk_parquet::package::{Config, Cut, End, package_with};
 use brisk_parquet::part::{PartConfig, write_part};
+use brisk_parquet::parts::listed;
 use brisk_parquet::verify::{Options, verify_broker};
 use serde_json::json;
 
@@ -27,8 +31,9 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const USAGE: &str = "usage: brisk-parquet verify DIRECTORY [--row-group ROWS] [--threads N] [--format FORMAT]\n       \
     brisk-parquet package --spool DIR --midnight NS --out DIR [--day-start PART] [--cut-state FILE --cut-clock US] \
-    [--end parts|cut|repair] [--state-out FILE] [--threads N] [--range-rows N] PART...\n       \
-    brisk-parquet state --spool DIR --midnight NS --state-out FILE [--cut-state FILE --cut-clock US] [--day-start PART] PART...\n       \
+    [--end parts|cut|repair] [--state-out FILE] [--threads N] [--range-rows N] [--parts-file FILE] [PART...]\n       \
+    brisk-parquet state --spool DIR --midnight NS --state-out FILE [--cut-state FILE --cut-clock US] [--day-start PART] \
+    [--parts-file FILE] [PART...]\n       \
     brisk-parquet part --out DIR --midnight NS [--threads N] < LINES\n       \
     brisk-parquet schemas DIRECTORY";
 
@@ -67,7 +72,23 @@ fn threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
-fn configuration(args: &Args, write: bool) -> Option<Config> {
+/// The parts of `package` and `state`: those `--parts-file` names (one path per line; `-` for standard input), then the
+/// positional ones.
+fn parts(args: &Args) -> Res<Vec<PathBuf>> {
+    let mut parts = match args.flags.get("parts-file").map(String::as_str) {
+        None => Vec::new(),
+        Some("-") => listed(&std::io::read_to_string(std::io::stdin().lock())?),
+        Some(file) => listed(&std::fs::read_to_string(file).map_err(|error| {
+            Failure::Fault(anyhow::anyhow!(
+                "cannot read the parts file {file}: {error}"
+            ))
+        })?),
+    };
+    parts.extend(args.words.iter().map(PathBuf::from));
+    Ok(parts)
+}
+
+fn configuration(args: &Args, write: bool, parts: Vec<PathBuf>) -> Option<Config> {
     let cut = match (args.path("cut-state"), args.number::<i64>("cut-clock")?) {
         (Some(state), Some(clock)) => Some(Cut { state, clock }),
         (None, None) => None,
@@ -81,7 +102,7 @@ fn configuration(args: &Args, write: bool) -> Option<Config> {
     };
     Some(Config {
         spool: args.path("spool")?,
-        parts: args.words.iter().map(PathBuf::from).collect(),
+        parts,
         out: if write { Some(args.path("out")?) } else { None },
         midnight: args.number::<i64>("midnight")??,
         day_start: args.path("day-start"),
@@ -144,7 +165,11 @@ fn main() -> ExitCode {
             ))
         }
         Some(kind @ ("package" | "state")) => {
-            let Some(config) = configuration(&args, kind == "package") else {
+            let parts = match parts(&args) {
+                Ok(parts) => parts,
+                Err(error) => return finish(Err(error)),
+            };
+            let Some(config) = configuration(&args, kind == "package", parts) else {
                 return usage();
             };
             let progress = |label: &str| eprintln!("progress: {label}");

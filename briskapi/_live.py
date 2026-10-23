@@ -699,9 +699,10 @@ class Feed:
 
     def _finish_segment(self, spool, stats, *, upload, output, repair=False):
         """Ship what is left of a segment, in pieces (Spool.ship; the last repaired with its end if asked), keep
-        them in `output`, upload them and `stats`' timing summary; the spool is removed after. Returns each
-        piece's result (trading_date, name, path, uploaded, timing_uploaded, repaired), the timing summary's in
-        the last."""
+        them in `output`, upload them and `stats`' timing summary; the spool is removed after, unless a piece of it
+        could be neither saved nor kept: then it stays where it is, for the next feed to start to finish
+        (_recover), and a warning says so. Returns each piece's result (trading_date, name, path, uploaded,
+        timing_uploaded, repaired), the timing summary's in the last."""
         results = []
         try:
             while spool and (upload or output):
@@ -717,7 +718,12 @@ class Feed:
                 results[-1]['timing_uploaded'] = self._upload_timing(stats)
         finally:
             if spool:
-                spool.remove()
+                lost = [result for result in results if result['error'] and not result['path']]
+                if lost:
+                    warnings.warn(f'Nothing of {lost[0]["name"] or "the recording"} could be saved; its spool is left in '
+                                  f'{spool.path}, which the next feed to start finishes (delete it to give it up)')
+                else:
+                    spool.remove()
         return results
 
     def _result(self):

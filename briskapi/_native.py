@@ -39,14 +39,15 @@ def run(arguments, progress=None, lines=None) -> str:
     """Run `brisk-parquet` and return what it prints. `progress(label)` is told of each `progress: label` line as it
     comes; `lines` (an iterable of bytes) is what it reads. A recording it refuses raises ValueError with its message; any
     other failure, RuntimeError."""
+    # Bytes, decoded as UTF-8: the program writes UTF-8, and a text pipe would read it in the console's code page (cp932 on a
+    # Japanese Windows), which cannot decode a path or a message with a character outside it.
     process = subprocess.Popen([binary(), *map(str, arguments)], stdin=subprocess.PIPE if lines is not None else None,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=lines is None)
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     messages = []
 
     def watch():
         for line in process.stderr:
-            line = line.decode(errors='replace') if isinstance(line, bytes) else line
-            line = line.rstrip('\n')
+            line = line.decode(errors='replace').rstrip('\n')
             if line.startswith('progress: '):
                 if progress:
                     progress(line[len('progress: '):])
@@ -73,7 +74,7 @@ def run(arguments, progress=None, lines=None) -> str:
     process.wait()
     for reader in readers:
         reader.join()
-    out = out.decode() if isinstance(out, bytes) else out
+    out = out.decode(errors='replace')
     if process.returncode == 0:
         return out
     message = '\n'.join(messages)
@@ -91,6 +92,12 @@ def part(lines, out, midnight, threads=None):
     return json.loads(run(arguments, lines=lines))
 
 
+def _listed(parts):
+    """The parts, a path a line, for brisk-parquet's standard input (`--parts-file -`). A day has thousands of parts, and a
+    Windows command line holds 32,767 characters: listed as arguments, a day's did not start the program ([WinError 206])."""
+    return [str(part).encode() + b'\n' for part in parts]
+
+
 def package(spool, parts, out, midnight, *, day_start=None, cut=None, end='parts', state_out=None, threads=None, range_rows=None,
             progress=None):
     """Write consecutive parts of a spooled segment (`spool`: its folder) as a recording in `out`, a range of issues at a
@@ -105,7 +112,7 @@ def package(spool, parts, out, midnight, *, day_start=None, cut=None, end='parts
             arguments += [flag, value]
     if cut:
         arguments += ['--cut-state', cut[0], '--cut-clock', cut[1]]
-    return json.loads(run([*arguments, *parts], progress))
+    return json.loads(run([*arguments, '--parts-file', '-'], progress, lines=_listed(parts)))
 
 
 _PACKAGE_PROGRESS = re.compile(r'package: (?:(preparing|finalizing)|(batches|quotes|trades) (\d+)/(\d+))')
@@ -129,7 +136,7 @@ def state(spool, parts, midnight, state_out, *, day_start=None, cut=None, thread
             arguments += [flag, value]
     if cut:
         arguments += ['--cut-state', cut[0], '--cut-clock', cut[1]]
-    return json.loads(run([*arguments, *parts]))['clock']
+    return json.loads(run([*arguments, '--parts-file', '-'], lines=_listed(parts)))['clock']
 
 
 def threads() -> int:

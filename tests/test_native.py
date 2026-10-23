@@ -184,7 +184,7 @@ def test_the_expected_schemas_are_python_s(tmp_path):
 
 # Packaging: parts of a spooled segment, as one recording
 
-from test_spool import same_tables, session, spooled  # noqa: E402  (the segment's fixtures)
+from test_spool import many_parts, same_tables, session, spooled  # noqa: E402  (the segment's fixtures)
 import reference_package  # noqa: E402
 
 
@@ -220,6 +220,54 @@ def segment(tmp_path):
     spool.close_part(wait=True)
     assert len(spool.parts()) > 5
     return spool
+
+
+def test_the_parts_go_on_the_programs_standard_input_not_its_command_line(tmp_path, segment, monkeypatch):
+    # Windows' CreateProcess takes 32,767 characters: a day's 1,670 parts as arguments raised WinError 206 before the program
+    # started. The list is read from --parts-file (a path a line; `-`: stdin), so the command line is the same for any count.
+    commands = []
+    real = _native.subprocess.Popen
+    monkeypatch.setattr(_native.subprocess, 'Popen', lambda command, **options: commands.append(command) or real(command, **options))
+    midnight = _parquet.midnight_ns(_parquet.bootstrap_row(segment.parts()[0])['trading_date'])
+    parts = segment.parts()
+    absent = [tmp_path / 'nowhere' / 'segment' / 'parts' / f'{n:06d}' for n in range(1, 10_001)]
+    assert sum(len(str(p)) + 1 for p in absent) > 32_767
+    with pytest.raises(ValueError, match='Missing'):   # the program ran, and read the list down to a part that is not there
+        _native.state(segment.path, parts + absent, midnight, tmp_path / 'state.parquet', day_start=parts[0])
+    with pytest.raises(ValueError, match='Missing'):
+        _native.package(segment.path, parts + absent, tmp_path / 'out', midnight)
+    assert len(commands) == 2
+    for command in commands:
+        assert command[-2:] == ['--parts-file', '-'] and sum(len(word) + 1 for word in command) < 1000
+        assert str(parts[1]) not in command and str(absent[-1]) not in command   # --day-start names the first
+    # And positional parts still work, for the program's other callers.
+    out = json.loads(_native.run(['state', '--spool', segment.path, '--midnight', midnight, '--state-out', tmp_path / 'state.parquet',
+                                  '--day-start', parts[0], *parts]))
+    assert out['clock'] == _native.state(segment.path, parts, midnight, tmp_path / 'state2.parquet', day_start=parts[0])
+
+
+def test_a_parts_file_is_read_as_the_positional_parts_are(tmp_path, segment):
+    midnight = _parquet.midnight_ns(_parquet.bootstrap_row(segment.parts()[0])['trading_date'])
+    parts = segment.parts()
+    listing = tmp_path / 'parts.txt'
+    listing.write_text('\ufeff' + '\r\n'.join(map(str, parts[:-1])) + '\r\n\r\n', encoding='utf-8')   # as a Windows editor leaves it
+    arguments = ['package', '--spool', segment.path, '--midnight', midnight, '--day-start', parts[0]]
+    by_file = json.loads(_native.run([*arguments, '--out', tmp_path / 'file', '--parts-file', listing, parts[-1]]))
+    by_words = json.loads(_native.run([*arguments, '--out', tmp_path / 'words', *parts]))
+    assert by_file == by_words
+    same_tables(tmp_path / 'file', tmp_path / 'words')
+    with pytest.raises(RuntimeError, match='cannot read the parts file'):
+        _native.run([*arguments, '--out', tmp_path / 'missing', '--parts-file', tmp_path / 'nowhere.txt'])
+
+
+def test_a_segment_of_hundreds_of_parts_is_packaged_as_python_does(tmp_path):
+    spool, _ = many_parts(tmp_path, 500)
+    parts = spool.parts()
+    result = two_ways(tmp_path, spool, parts)
+    assert result['summary']['batches'] == 500
+    midnight = _parquet.midnight_ns(_parquet.bootstrap_row(parts[0])['trading_date'])
+    clock = _native.state(spool.path, parts[:450], midnight, tmp_path / 'state450.parquet', day_start=parts[0])
+    assert clock == _parquet.part_index(parts[449], midnight)['last']
 
 
 def test_a_whole_segment_is_packaged_as_python_does(tmp_path, segment):
