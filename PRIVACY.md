@@ -2,7 +2,7 @@
 
 [English](PRIVACY.md) | [日本語](PRIVACY.ja.md)
 
-Policy version 9, effective 14 October 2026. Applies to the `brisk` Python API and
+Policy version 10, effective 30 October 2026. Applies to the `brisk` Python API and
 CLI in this repository, the private recording archive they upload to and its cloud API.
 
 ## Your private archive
@@ -99,11 +99,13 @@ own timing table; downloading it returns the whole recording.
   master and auction quotes (prices, quantities, turnover, issue status, codes, flags and
   source clocks; on each side of the order book the ten best prices holding orders, with
   their quantities and order counts, the same for the closing-condition orders, and the
-  whole board's order totals); and every trade, with its time, price, shares and side,
+  whole board's order totals; and in a broker's recording every price holding orders on
+  either side of both books, as what changed from one update to the next, with each
+  security's whole books every 1,000 changes); and every trade, with its time, price, shares and side,
   including those the session's snapshot restores from earlier that day. Version 5 added
   the order book, turnover and broker issue status; version 6 the trades, the
   closing-condition books and the board totals; version 9 the same from Matsui, Monex and SMBC
-  Nikko sessions. Demo content is checked against the pinned
+  Nikko sessions; version 10 the whole books beyond the ten best prices. Demo content is checked against the pinned
   reference replay. Broker content is uploader-declared: the archive checks that it holds
   exactly these fields, canonically encoded, and that it is well formed (identities, order, clocks,
   value ranges), but not the market's own consistency.

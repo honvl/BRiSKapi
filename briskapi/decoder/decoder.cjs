@@ -10,12 +10,18 @@ const manifest = require('./assets.json');
 const { verifyAsset, loadWebAssets } = require('./web.cjs');
 const BUFFER = 4 * 1024 * 1024;
 const LEVELS = 10;   // price levels kept on each side of a quote's book
+// With bookChanges, the most levels a side is read to, all its nonempty ones (a side spans fewer ticks than this between
+// its daily limits); the quote keeps LEVELS and says what changed in book_changes.
+const MAX_LEVELS = 65536;
+// The books of book_changes, by their index in it: bid, ask, and those of the closing-condition orders.
+const BOOKS = ['bid_levels', 'ask_levels', 'bid_closing_levels', 'ask_closing_levels'];
 const WINDOW = 64;   // book rows either side of the best prices read per call (a call costs the same for 1 row or 400)
 const HISTORY = 50000;   // trades per history batch (those a snapshot restores)
 const BOARD_CHECK_EVERY = 4096;   // ladder reads between checks against _getItaRows (see BoardReader)
 const BOARD_RETRY_EVERY = 20000;  // books read before a BoardReader is looked for again, while no board had orders
-// board.wat, assembled (wat2wasm): the board totals summed in the decoder's memory.
-const BOARD_KERNEL = 'AGFzbQEAAAABCAFgBH9/f38AAg8BA2VudgZtZW1vcnkCAAEDAgEABwcBA3N1bQAACrYDAbMDBAZ/AXwEewR/QX8hD0F/IRBBfyERQX8hEgJAA0AgBCACTw0BIAEgBGohBUE4IAVBOHBrIQYgBiACIARrSwRAIAIgBGshBgsgACAFQThuQQJ0aigCACAFQThwQcgAbGohByAHIAZByABsaiEIIAQhCQNAIAsgB/0AAwj98AEhCyAMIAf9AAMo/fABIQwgDSAH/V0CGP3JAf3OASENIA4gB/1dAjj9yQH9zgEhDiAHKwMIIQogCSAPIApEAAAAAAAAAABkIApEAAAAAAAAAABjchshDyAHKwMQIQogCSAQIApEAAAAAAAAAABkIApEAAAAAAAAAABjchshECAHKwMoIQogCSARIBFBAEggCkQAAAAAAAAAAGQgCkQAAAAAAAAAAGNycRshESAHKwMwIQogCSASIBJBAEggCkQAAAAAAAAAAGQgCkQAAAAAAAAAAGNycRshEiAJQQFqIQkgB0HIAGohByAHIAhJDQALIAQgBmohBAwACwsgAyAL/QsDACADIAz9CwMQIAMgDf0LAyAgAyAO/QsDMCADIA82AkAgAyAQNgJEIAMgETYCSCADIBI2AkwL';
+// board.wat, assembled (wat2wasm): the board totals summed in the decoder's memory, its book read whole (compact) and
+// compared with the last read (diff).
+const BOARD_KERNEL = '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';
 // The order groups of a _getItaRows row (204 bytes): quantity (u64) and order count (u64) word offsets.
 const GROUPS = {
   bid: { name: 'bid', buy: true, closing: false, quantity: 5, orders: 9 },
@@ -260,6 +266,9 @@ class Decoder {
   // options.callbacks: { send(Buffer), heartbeat(ns BigInt), frameNumbers(Array), basePrice(issueIndex),
   //   authError(), marketFinished() }, the vendor client's six WASM callbacks.
   // options.keepTrades: false for a decoder whose trades nothing reads (a quote worker's): see QuoteHistory.
+  // options.bookChanges: each quote reads every level of its four books and says, in book_changes, which differ from
+  //   its issue's previous quote read by this decoder (see changes()). For the decoders whose quotes a recording keeps:
+  //   a decoder whose reads go anywhere else (the fast lane's) would leave the changes of the next recorded one short.
   // options.boot: { exceptional_sq, base_prices } from the app boot response, applied in the
   //   vendor client's order: after the master is loaded, before the snapshot.
   // options.checkMaster(master): throws if the master read does not look like a market, before
@@ -296,8 +305,12 @@ class Decoder {
   // options.schedule: the boot's schedule_info. Used only by decoders that take one (the 2026
   //   builds export _createSchedule; the 2021 demo's doesn't); null there is an error.
   constructor(w, assets, { protocolVersion = manifest.protocol_version, callbacks = {}, boot = {}, checkMaster, schedule,
-    stderr = { invalidIssueCode: 0 }, qrm = new QuoteHistory() } = {}) {
+    stderr = { invalidIssueCode: 0 }, qrm = new QuoteHistory(), bookChanges = false } = {}) {
     this.w = w;
+    this.bookChanges = bookChanges;
+    this.levelLimit = bookChanges ? MAX_LEVELS : LEVELS;
+    this.books = new Map();   // with bookChanges, each issue's book as its last quote read it (a ladder: see changes())
+    this.prices = [];         // by tick type, the price of each tick index (0: not looked up yet): see priceOf()
     this.stderr = stderr;
     this.board = null;         // the BoardReader that reads books from the ladder, if it could be used
     this.boardSkipped = null;  // why it is not (or no longer)
@@ -632,8 +645,122 @@ class Decoder {
       quote.issue_status = words[6 * this.ohlc + this.layoutShift + 37] - 8;
       if (!(quote.issue_status >= 0 && quote.issue_status <= 7)) throw new Error(`Issue status unrecognised: ${m.code}`);
     }
-    Object.assign(quote, this.book(issue_id, m, quote));
+    if (!this.bookChanges) return Object.assign(quote, this.book(issue_id, m, quote));
+    const { book, ladder } = this.wholeBook(issue_id, m, quote);
+    Object.assign(quote, book);
+    quote.book_changes = this.changes(issue_id, ladder, m);
     return quote;
+  }
+
+  // With bookChanges: the quote's book (its lists the best LEVELS) and its ladder, every level that holds anything, as
+  // BoardReader reads it whole or (when it cannot be used) the walk. A ladder is the levels' tick indices (ascending),
+  // their four quantities and their four order counts (bid, ask, closing-condition bid and ask, as BOOKS), and how many.
+  wholeBook(issue_id, m, quote) {
+    if (!this.board && this.boardRetry !== null && ++this.boardRetry % BOARD_RETRY_EVERY === 0) this.discoverBoard();
+    if (!this.board) return this.walkedWhole(issue_id, m, quote);
+    const read = this.board.book(issue_id, m, quote, true);
+    // Now and then checked against the decoder's own walk, every level of it: a difference ends it for this decoder.
+    if (++this.board.reads % BOARD_CHECK_EVERY === 0) {
+      const walked = this.walkedWhole(issue_id, m, quote);
+      if (JSON.stringify(walked.book) !== JSON.stringify(read.book) || !sameLadder(walked.ladder, read.ladder)) {
+        this.boardSkipped = `its book of ${m.code} differed from _getItaRows' after ${this.board.reads} reads`;
+        this.board = null;
+        return walked;
+      }
+    }
+    return read;
+  }
+
+  walkedWhole(issue_id, m, quote) {
+    const book = this.walkBook(issue_id, m, quote), at = new Map();
+    BOOKS.forEach((name, k) => {
+      for (const [price, quantity, orders] of book[name]) {
+        const index = this.w._getTickPrice10ToIndex(this.id, m.tick_type, price);
+        if (!at.has(index)) at.set(index, [0, 0, 0, 0, 0, 0, 0, 0]);
+        at.get(index)[k] = quantity;
+        at.get(index)[4 + k] = orders;
+      }
+      book[name] = book[name].slice(0, LEVELS);
+    });
+    const indices = [...at.keys()].sort((a, b) => a - b), n = indices.length;
+    const ladder = { n, idx: Int32Array.from(indices), q: new Float64Array(4 * n), c: new Uint32Array(4 * n) };
+    indices.forEach((index, j) => {
+      const v = at.get(index);
+      for (let k = 0; k < 4; k++) [ladder.q[4 * j + k], ladder.c[4 * j + k]] = [v[k], v[4 + k]];
+    });
+    return { book, ladder };
+  }
+
+  // The price of a tick index for this tick type: the lowest price _getTickPrice10ToIndex gives it, remembered.
+  priceOf(m, index) {
+    let cache = this.prices[m.tick_type];
+    if (!cache || index >= cache.length) {
+      const grown = new Int32Array(Math.max(index + 1, 2 * (cache?.length ?? 4096)));
+      if (cache) grown.set(cache);
+      this.prices[m.tick_type] = cache = grown;
+    }
+    let price = cache[index];
+    if (!price) {
+      let lo = 0, hi = 2 * m.limit_up10 + 1;   // a level with orders lies between the limits
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (this.w._getTickPrice10ToIndex(this.id, m.tick_type, mid) < index) lo = mid + 1; else hi = mid;
+      }
+      cache[index] = price = lo;
+    }
+    return price;
+  }
+
+  // The levels of a quote's four books that differ from its issue's previous quote read here, from their ladders (see
+  // wholeBook()): [book, price10, quantity, orders], book the index in BOOKS, each book's best first, and 0 shares and
+  // 0 orders for a level that emptied. An issue's first quote holds its whole book. Keeps the ladder for the next.
+  changes(issue_id, ladder, m) {
+    let before = this.books.get(issue_id);
+    const byBook = [[], [], [], []];
+    const emit = (k, index, value, orders) => byBook[k].push(value
+      ? [k, this.priceOf(m, index), quantity(value, m), orders] : [k, this.priceOf(m, index), 0, 0]);
+    const best = () => [...byBook[0].reverse(), ...byBook[1], ...byBook[2].reverse(), ...byBook[3]];
+    const reader = ladder.ptr !== undefined ? this.board : null;
+    if (reader) {   // read by the kernel: compared by it (diff), the last ladder kept in the decoder's memory
+      if (before && before.ptr === undefined) before = reader.place(before);
+      for (const [index, k, value, orders] of reader.changesOf(ladder, before)) emit(k, index, value, orders);
+      this.books.set(issue_id, reader.keep(ladder, before));
+      return best();
+    }
+    if (before && before.ptr !== undefined) {   // kept by a reader no longer used: its arrays, read here
+      const buffer = this.w.HEAPU8.buffer;
+      before = { n: before.n, idx: new Int32Array(buffer, before.ptr, before.n),
+        q: new Float64Array(buffer, before.ptr + 4 * before.cap, 4 * before.n),
+        c: new Uint32Array(buffer, before.ptr + 36 * before.cap, 4 * before.n) };
+      this.books.delete(issue_id);
+    }
+    const { n, idx, q, c } = ladder, pn = before ? before.n : 0;
+    for (let i = 0, j = 0; i < n || j < pn;) {
+      const a = i < n ? idx[i] : Infinity, b = j < pn ? before.idx[j] : Infinity;
+      if (a === b) {
+        for (let k = 0; k < 4; k++) {
+          if (q[4 * i + k] !== before.q[4 * j + k] || c[4 * i + k] !== before.c[4 * j + k]) emit(k, a, q[4 * i + k], c[4 * i + k]);
+        }
+        i++; j++;
+      } else if (a < b) {
+        for (let k = 0; k < 4; k++) if (q[4 * i + k]) emit(k, a, q[4 * i + k], c[4 * i + k]);
+        i++;
+      } else {
+        for (let k = 0; k < 4; k++) if (before.q[4 * j + k]) emit(k, b, 0, 0);
+        j++;
+      }
+    }
+    let kept = this.books.get(issue_id);
+    if (!kept || kept.idx.length < n) {
+      const cap = Math.max(16, 2 * n);
+      kept = { n: 0, idx: new Int32Array(cap), q: new Float64Array(4 * cap), c: new Uint32Array(4 * cap) };
+      this.books.set(issue_id, kept);
+    }
+    kept.idx.set(idx.subarray(0, n));
+    kept.q.set(q.subarray(0, 4 * n));
+    kept.c.set(c.subarray(0, 4 * n));
+    kept.n = n;
+    return best();   // bids best first are the highest indices first; asks the lowest
   }
 
   // The book of a quote: the market orders, each order group's totals over the whole board, the quantity and
@@ -707,7 +834,8 @@ class Decoder {
     const anchor = (hint, group) => (hint >= window.first && hint <= window.last ? window
       : group.buy ? this.read(issue_id, Math.max(low, hint - WINDOW + 1), hint, group.closing)
         : this.read(issue_id, hint, Math.min(high, hint + WINDOW - 1), group.closing));
-    const side = (group, hint) => this.levels(issue_id, low, high, group, anchor(hint, group));
+    const limit = this.levelLimit;
+    const side = (group, hint) => this.levels(issue_id, low, high, group, anchor(hint, group), limit);
     const bid_levels = side(GROUPS.bid, bidHint);
     const ask_levels = side(GROUPS.ask, askHint);
     const bid_closing_levels = totals.bid_closing_total_quantity ? side(GROUPS.bid_closing, bidHint) : [];
@@ -716,7 +844,7 @@ class Decoder {
       const level = levels.find(([p]) => p === price);
       if (level) return level.slice(1);
       // A price the walk passed, or every order on the side having been read, means none there.
-      const passed = levels.length < LEVELS || (group.buy ? price >= levels.at(-1)[0] : price <= levels.at(-1)[0]);
+      const passed = levels.length < limit || (group.buy ? price >= levels.at(-1)[0] : price <= levels.at(-1)[0]);
       if (!price || !inside(price) || passed) return [0, 0];
       const i = index(price);
       const r = i >= window.first && i <= window.last ? window : this.read(issue_id, i, i, false);
@@ -733,25 +861,31 @@ class Decoder {
   // where the quote says it is. The rows beyond it on the better side are read, in one call, only if its OVER
   // (bids) or UNDER (asks) has orders there, as in a crossed auction book; the worse side then a WINDOW at a
   // time, until there are enough levels or nothing lies beyond.
-  levels(issue_id, low, high, group, anchor) {
+  levels(issue_id, low, high, group, anchor, limit = LEVELS) {
     const { buy, closing, quantity, orders } = group;
     const over = r => u64(r.u, 51 + quantity), under = r => u64(r.u, 102 + quantity);
     const better = buy ? over : under, worse = buy ? under : over;
     const levels = [];
     const take = r => {
       const count = r.last - r.first + 1;
-      for (let j = 0; j < count && levels.length < LEVELS; j++) {
+      for (let j = 0; j < count && levels.length < limit; j++) {
         const b = 153 + 51 * (buy ? count - 1 - j : j);
         const q = u64(r.u, b + quantity);
         if (q) levels.push([r.u[b], q, u64(r.u, b + orders)]);
       }
     };
     if (better(anchor) && (buy ? anchor.last < high : anchor.first > low)) {
-      take(buy ? this.read(issue_id, anchor.last + 1, high, closing) : this.read(issue_id, low, anchor.first - 1, closing));
+      // In reads the buffer holds, as a crossed side's better rows may span more ticks than one (a whole book's).
+      const rows = Math.floor((BUFFER - 612) / 204), end = buy ? anchor.last : anchor.first;
+      for (let first = buy ? high : low; levels.length < limit && (buy ? first > end : first < end);) {
+        const last = buy ? Math.max(end + 1, first - rows + 1) : Math.min(end - 1, first + rows - 1);
+        take(this.read(issue_id, Math.min(first, last), Math.max(first, last), closing));
+        first = last + (buy ? -1 : 1);
+      }
     }
     for (let r = anchor; ;) {
       take(r);
-      if (levels.length >= LEVELS || !worse(r) || (buy ? r.first <= low : r.last >= high)) return levels;
+      if (levels.length >= limit || !worse(r) || (buy ? r.first <= low : r.last >= high)) return levels;
       r = buy ? this.read(issue_id, Math.max(low, r.first - WINDOW), r.first - 1, closing)
         : this.read(issue_id, r.last + 1, Math.min(high, r.last + WINDOW), closing);
     }
@@ -990,14 +1124,79 @@ class BoardReader {
     const w = decoder.w;
     if (typeof w.dynCall_iiii !== 'function' || typeof w.dynCall_vi !== 'function') throw new Error('no dynCall exports');
     const kernel = new WebAssembly.Instance(new WebAssembly.Module(Buffer.from(BOARD_KERNEL, 'base64')), { env: { memory } });
-    const reader = new BoardReader(decoder, boardCalls(wasmBytes), memory, kernel.exports.sum);
+    const reader = new BoardReader(decoder, boardCalls(wasmBytes), memory, kernel.exports);
     reader.locate();
     reader.check();
     return reader;
   }
 
-  constructor(decoder, calls, memory, sum) {
-    Object.assign(this, { decoder, calls, memory, sum, reads: 0, prices: new Map(), sums: decoder.w._malloc(80) });
+  constructor(decoder, calls, memory, { sum, compact, diff }) {
+    Object.assign(this, { decoder, calls, memory, sum, compact, diff, reads: 0, sums: decoder.w._malloc(80), out: 0, cap: 0,
+      changed: 0, changedCap: 0 });
+  }
+
+  // Memory of the decoder's for kernel output, `bytes` at least, in place of `at` (`room`: how much it holds): [at, room].
+  // A decoder's memory can grow when it is taken, and views on it go with the old buffer (see views()).
+  room(at, room, bytes) {
+    if (bytes <= room) return [at, room];
+    if (at) this.decoder.w._free(at);
+    return [this.decoder.w._malloc(bytes), bytes];
+  }
+
+  // The changes of a ladder this reader read (cur) from an issue's last, kept in the decoder's memory (prev: { ptr, cap,
+  // n }, or none), as diff() writes them: [index, book, quantity, orders] records. prev then holds cur, grown if need be.
+  changesOf(cur, prev) {
+    const pn = prev ? prev.n : 0;
+    [this.changed, this.changedCap] = this.room(this.changed, this.changedCap, 96 * (cur.n + pn) + 8);
+    const count = this.diff(cur.ptr, cur.cap, cur.n, prev ? prev.ptr : 0, prev ? prev.cap : 0, pn, this.changed);
+    const out = [], buffer = this.memory.buffer, words = new Int32Array(buffer, this.changed, 6 * count);
+    const values = new Float64Array(buffer, this.changed, 3 * count);
+    for (let r = 0; r < count; r++) out.push([words[6 * r], words[6 * r + 1], values[3 * r + 1], words[6 * r + 4] >>> 0]);
+    return out;
+  }
+
+  // An issue's last ladder in the decoder's memory, `cur` copied in: { ptr, cap, n }.
+  keep(cur, prev) {
+    let kept = prev;
+    if (!kept || kept.cap < cur.n) {
+      if (kept) this.decoder.w._free(kept.ptr);
+      const cap = (Math.max(16, 2 * cur.n) + 1) & ~1;
+      kept = { ptr: this.decoder.w._malloc(52 * cap), cap, n: 0 };
+    }
+    const bytes = new Uint8Array(this.memory.buffer);
+    bytes.copyWithin(kept.ptr, cur.ptr, cur.ptr + 4 * cur.n);
+    bytes.copyWithin(kept.ptr + 4 * kept.cap, cur.ptr + 4 * cur.cap, cur.ptr + 4 * cur.cap + 32 * cur.n);
+    bytes.copyWithin(kept.ptr + 36 * kept.cap, cur.ptr + 36 * cur.cap, cur.ptr + 36 * cur.cap + 16 * cur.n);
+    kept.n = cur.n;
+    return kept;
+  }
+
+  // A ladder in the decoder's memory as views (`kept` from keep(), or one this reader read).
+  views_of(kept) {
+    const buffer = this.memory.buffer;
+    return { n: kept.n, idx: new Int32Array(buffer, kept.ptr, kept.n), q: new Float64Array(buffer, kept.ptr + 4 * kept.cap, 4 * kept.n),
+      c: new Uint32Array(buffer, kept.ptr + 36 * kept.cap, 4 * kept.n) };
+  }
+
+  // A ladder held in arrays (the walk's) copied into the decoder's memory, for diff().
+  place(ladder) {
+    const cap = (Math.max(16, 2 * ladder.n) + 1) & ~1, ptr = this.decoder.w._malloc(52 * cap), buffer = this.memory.buffer;
+    new Int32Array(buffer, ptr, ladder.n).set(ladder.idx.subarray(0, ladder.n));
+    new Float64Array(buffer, ptr + 4 * cap, 4 * ladder.n).set(ladder.q.subarray(0, 4 * ladder.n));
+    new Uint32Array(buffer, ptr + 36 * cap, 4 * ladder.n).set(ladder.c.subarray(0, 4 * ladder.n));
+    return { ptr, cap, n: ladder.n };
+  }
+
+  // A board's ladder whole, as compact() writes it into this reader's buffer (a ladder, as Decoder.wholeBook() has
+  // them, viewing that buffer: good until the next read).
+  ladder(map, start, size, base) {
+    if (size > this.cap) {
+      if (this.out) this.decoder.w._free(this.out);
+      this.cap = (size + 1) & ~1;
+      this.out = this.decoder.w._malloc(52 * this.cap);
+    }
+    const n = this.compact(map, start, size, base, this.out, this.cap, this.sums);
+    return { ...this.views_of({ ptr: this.out, cap: this.cap, n }), ptr: this.out, cap: this.cap };
   }
 
   views() {
@@ -1133,26 +1332,13 @@ class BoardReader {
     }
   }
 
-  // The price of a tick index for this tick type: the lowest price _getTickPrice10ToIndex gives it, remembered.
   price(m, index) {
-    let cache = this.prices.get(m.tick_type);
-    if (!cache) this.prices.set(m.tick_type, cache = new Map());
-    let price = cache.get(index);
-    if (price === undefined) {
-      const { w, id } = this.decoder;
-      let lo = 0, hi = 2 * m.limit_up10 + 1;   // a level with orders lies between the limits
-      while (lo < hi) {
-        const mid = Math.floor((lo + hi) / 2);
-        if (w._getTickPrice10ToIndex(id, m.tick_type, mid) < index) lo = mid + 1; else hi = mid;
-      }
-      cache.set(index, price = lo);
-    }
-    return price;
+    return this.decoder.priceOf(m, index);
   }
 
   // As walkBook() gives it, key for key. A quantity _getItaRows could not convert to an integer (a board in an
   // inconsistent state) is a trap here as there, and one beyond 2^53 the same error.
-  book(issue_id, m, quote) {
+  book(issue_id, m, quote, whole = false) {
     const p = this.board(issue_id);
     this.views();
     const { u, i, f, layout } = this, q = at => quantity(f[at >> 3], m);
@@ -1160,7 +1346,10 @@ class BoardReader {
     const base = i[(p + layout.base) >> 2], mk = p + layout.market;
     const book = { market_buy_quantity: q(mk + 8), market_sell_quantity: q(mk + 40),
       closing_market_buy_quantity: q(mk + 16), closing_market_sell_quantity: q(mk + 48) };
-    this.sum(map, start, size, this.sums);
+    // With `whole`, the ladder in one pass (compact, which sums it too) and the lists its best LEVELS, so a book of
+    // hundreds of levels is not read level by level here; the ladder goes with the book.
+    const ladder = whole ? this.ladder(map, start, size, base) : (this.sum(map, start, size, this.sums), null);
+    if (whole && u.buffer !== this.memory.buffer) return this.book(issue_id, m, quote, whole);   // its buffer grew memory
     const sums = this.sums, orders = k => u[(sums + 32 + 8 * k) >> 2] + 4294967296 * u[(sums + 36 + 8 * k) >> 2];
     const totals = { bid_total_quantity: q(sums), bid_total_orders: orders(0), bid_closing_total_quantity: q(sums + 8),
       bid_closing_total_orders: orders(1), ask_total_quantity: q(sums + 16), ask_total_orders: orders(2),
@@ -1169,22 +1358,31 @@ class BoardReader {
     // lowest up (the kernel found where they begin; every level beyond is empty).
     const levels = (quantity, count, buy, from) => {
       const out = [];
-      for (let slot = from; slot >= 0 && slot < size && out.length < LEVELS; slot += buy ? -1 : 1) {
+      for (let slot = from; slot >= 0 && slot < size && out.length < this.decoder.levelLimit; slot += buy ? -1 : 1) {
         const e = this.level(map, start, slot);
         if (f[(e + quantity) >> 3]) out.push([this.price(m, base + slot), q(e + quantity), u[(e + count) >> 2]]);
       }
       return out;
     };
     const from = k => this.i[(sums + 64 + 4 * k) >> 2];
-    const bid_levels = levels(8, 24, true, from(0)), ask_levels = levels(40, 56, false, from(2));
-    const bid_closing_levels = totals.bid_closing_total_quantity ? levels(16, 28, true, from(1)) : [];
-    const ask_closing_levels = totals.ask_closing_total_quantity ? levels(48, 60, false, from(3)) : [];
+    const top = (k, buy) => {
+      const { n, idx, q: v, c } = ladder, out = [];
+      for (let j = buy ? n - 1 : 0; j >= 0 && j < n && out.length < LEVELS; j += buy ? -1 : 1) {
+        if (v[4 * j + k]) out.push([this.price(m, idx[j]), quantity(v[4 * j + k], m), c[4 * j + k]]);
+      }
+      return out;
+    };
+    const side = (k, quantity, count, buy) => (whole ? top(k, buy) : levels(quantity, count, buy, from(k === 0 ? 0 : k === 1 ? 2 : k === 2 ? 1 : 3)));
+    const bid_levels = side(0, 8, 24, true), ask_levels = side(1, 40, 56, false);
+    const bid_closing_levels = totals.bid_closing_total_quantity ? side(2, 16, 28, true) : [];
+    const ask_closing_levels = totals.ask_closing_total_quantity ? side(3, 48, 60, false) : [];
+    const limit = whole ? LEVELS : this.decoder.levelLimit;
     const inside = price => price >= m.limit_down10 && price <= m.limit_up10;
     const at = (side, price, quantity, count, buy) => {
       const level = side.find(([x]) => x === price);
       if (level) return level.slice(1);
       // A price the walk passed, or every order on the side having been read, means none there.
-      const passed = side.length < LEVELS || (buy ? price >= side.at(-1)[0] : price <= side.at(-1)[0]);
+      const passed = side.length < limit || (buy ? price >= side.at(-1)[0] : price <= side.at(-1)[0]);
       if (!price || !inside(price) || passed) return [0, 0];
       const slot = this.decoder.w._getTickPrice10ToIndex(this.decoder.id, m.tick_type, price) - base;
       if (slot < 0 || slot >= size) return [0, 0];
@@ -1193,9 +1391,18 @@ class BoardReader {
     };
     const [bid_quantity, bid_orders] = at(bid_levels, quote.bid_price10, 8, 24, true);
     const [ask_quantity, ask_orders] = at(ask_levels, quote.ask_price10, 40, 56, false);
-    return { ...book, bid_quantity, bid_orders, ask_quantity, ask_orders, bid_levels, ask_levels, bid_closing_levels,
+    const read = { ...book, bid_quantity, bid_orders, ask_quantity, ask_orders, bid_levels, ask_levels, bid_closing_levels,
       ask_closing_levels, ...totals };
+    return whole ? { book: read, ladder } : read;
   }
+}
+
+// Whether two ladders (see Decoder.wholeBook()) hold the same levels.
+function sameLadder(a, b) {
+  if (a.n !== b.n) return false;
+  for (let j = 0; j < a.n; j++) if (a.idx[j] !== b.idx[j]) return false;
+  for (let j = 0; j < 4 * a.n; j++) if (a.q[j] !== b.q[j] || a.c[j] !== b.c[j]) return false;
+  return true;
 }
 
 module.exports = { Decoder, BoardReader, boardCalls, BOARD_KERNEL, QuoteHistory, frames, u64, looseU64, readMasterRecord, masterLayout, MASTER_LAYOUT, SCHEDULE_FIELDS, scheduleArgs,

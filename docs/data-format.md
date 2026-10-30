@@ -50,8 +50,8 @@ Every schema but the bars starts with the same four columns and ends with `symbo
 | `symbol` | string | The JPX code (left out with `map_symbols=False`) |
 
 Records are in time order (`ts_event`, then `instrument_id`, then `sequence`). Where several
-of your recordings overlap, each record appears once. `briskapi.Live` delivers them as the feed
-receives its batches, each batch's records in that order.
+of your recordings overlap, each record appears once (`book-deltas` reads one of them: see there).
+`briskapi.Live` delivers them as the feed receives its batches, each batch's records in that order.
 
 ### `trades`
 
@@ -83,6 +83,33 @@ receives its batches, each batch's records in that order.
 | `ask_px_NN` | float64 | ask level NN price (yen; NN from 00, the best, to 09); null past the last level |
 | `ask_sz_NN` | uint64 | ask level NN shares |
 | `ask_ct_NN` | uint32 | ask level NN orders |
+
+### `book-deltas`
+
+Every price level of a security's books, all day, as what changed: Databento's MBO records, at the
+grain BRiSK gives (price levels with their shares and order counts; BRiSK has no order IDs). A
+security's first update of a recording clears its books (`R`) and adds every level (`A`), flagged
+32; each update after that holds a record for each level that appears (`A`), changes (`M`) or
+empties (`C`), its last flagged 128. Replayed in order they give the whole books at every update:
+the regular bid and ask books and the closing-condition orders' (`closing`). `snapshot=True`
+(Historical's `get_range`, `brisk query --snapshot`, `Live.subscribe` with a `start`) begins with
+each security's books as of the start, flagged 32, so the records after it apply to known books;
+`Historical.timeseries.get_snapshot(schema="book-deltas")` returns those alone. The cloud API
+rebuilds them from a checkpoint the recording holds every 1,000 changes, never from the day's
+start. Recordings from before briskapi 1.9, and the demo's, have none. Where two of your
+recordings of a day overlap in time, the longer one's are read: each recording's changes are from
+its own previous update.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `action` | string | 'A' a price level appears, 'M' its shares or orders change, 'C' it empties, 'R' the security's books are cleared (a snapshot's levels follow) |
+| `side` | string | 'B' a bid level, 'A' an ask level, 'N' for 'R' |
+| `closing` | bool | The closing-condition orders' book, not the regular one |
+| `price` | float64 | The level's price (yen); null for 'R' |
+| `size` | uint64 | Shares at the level after this event (0 for C) |
+| `count` | uint32 | Orders at the level after this event (0 for C) |
+| `flags` | uint8 | 128 on an update's last record; 32 on a snapshot's (a security's first update, or the books as of the start with snapshot=true) |
+| `sequence` | uint64 | BRiSK's frame number |
 
 ### `definition`
 
@@ -234,7 +261,7 @@ its part. `briskapi.Recording(path)`, `Ticker` and `Market` read them for you;
 
 | File | One row per | Columns |
 | --- | --- | --- |
-| `data/order_book_depths.parquet` | Quote update | `bids`, `asks` (up to ten levels, best first: `price`, `size`, `count`, and v2's `order_id`, always 0), `flags`, `sequence` (the frame), `ts_event`, `identifier` (`CODE.XTKS`), `issue_id`, `seq` (the batch), then the quote fields as in `brisk-quotes` above, with prices as decimals |
+| `data/order_book_depths.parquet` | Quote update | `bids`, `asks` (up to ten levels, best first: `price`, `size`, `count`, and v2's `order_id`, always 0), `flags`, `sequence` (the frame), `ts_event`, `identifier` (`CODE.XTKS`), `issue_id`, `seq` (the batch), then the quote fields as in `brisk-quotes` above, with prices as decimals; in a broker's recording from briskapi 1.9 on, then `changes` (what of the four books changed since the security's previous update: `book` 0 bids, 1 asks, 2 and 3 the closing-condition orders', `price`, `size`, `count`; 0 shares for a level that emptied; the first update holds them whole) and `checkpoint` (null, but after every 1,000 changes of a security its whole books, in the same form) |
 | `data/trades.parquet` | Execution | `price`, `size`, `aggressor_side` (`BUY`, `SELL`, `NO_AGGRESSOR`), `trade_id`, `ts_event`, `identifier`, `issue_id`, `seq`, `frame`, `side` (BRiSK's raw type: 1 buyer-initiated, 2 seller-initiated) |
 | `data/equity.parquet` | Security | v2 `Equity`: `id` (`CODE.XTKS`), `raw_symbol` (the code), `currency`, `price_precision`, `price_increment`, `lot_size`, `max_price`/`min_price` (the day's limits), `ts_event`/`ts_init` (JST midnight); then `issue_id`, `tick_type`, `issue_type`, `name`, `base_price` |
 | `data/custom/BriskBatch.parquet` | Decoded batch (frame) | `seq`, `kind` (`bootstrap`, `history`, `quotes`, `end`), `received_unix_ms` (local receipt clock), `decode_ns`, `replay_lateness_ms`, `skipped_issues`, `frames`, `quote_updates`, `replay_wall_ms` (in a day repaired after a crash, the end's `frames` and `replay_wall_ms` are rebuilt from the recording); on the bootstrap row `source`, `trading_date`, `input_transport`, `market_issue_count` |

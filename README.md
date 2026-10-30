@@ -186,9 +186,11 @@ for record in live:             # or live.add_callback(fn); live.start(); live.b
     print(record.schema, record.symbol, record.ts_event)
 ```
 
-- **Schemas:** `trades`, `mbp-10`, `imbalance`, `definition`, `brisk-quotes` and the OHLCV bars
-  `ohlcv-1s` to `ohlcv-1d`, with the same columns and values as `Historical` returns for the same
-  session. `Live` builds its bars from the trades it receives, by the cloud's rules.
+- **Schemas:** `trades`, `mbp-10`, `book-deltas`, `imbalance`, `definition`, `brisk-quotes` and the
+  OHLCV bars `ohlcv-1s` to `ohlcv-1d`, with the same columns and values as `Historical` returns for
+  the same session. `Live` builds its bars from the trades it receives, by the cloud's rules.
+  `book-deltas` needs a `start` (`0` for the day so far): its books are replayed from the day's
+  start, and with `snapshot=True` it begins with each security's books as of then.
 - **Bars** come as soon as their interval ends, by the feed's clock: when a later batch is
   stamped past the end, or when this computer's clock, less the delay measured from BRiSK to this
   session (the largest of the last 10 seconds), passes it. A trade that arrives after its own
@@ -710,7 +712,11 @@ with quotas of 60 requests a minute and 2 GB a day per identity, and 120 request
   `XTKS.BRISK` is your own live recordings, whichever broker's BRiSK they came through.
   `XTKS.BRISKDEMO` is the public demo (2021-09-27), open to every identity.
 - **Schemas:** `trades`; `mbp-10` (ten levels per side; BRiSK gives books, not order events,
-  so `action` and `side` are `N`); `definition`; `imbalance` (opening and closing auction
+  so `action` and `side` are `N`); `book-deltas` (every price level of both books, all day, as
+  Databento's MBO records at price-level grain: a level appears, changes or empties; with
+  `snapshot=True` each security's whole books as of the start come first, and
+  `get_snapshot(schema="book-deltas")` returns them alone; broker recordings from 1.9 on);
+  `definition`; `imbalance` (opening and closing auction
   state: indicative price and volume, market-order imbalance); `brisk-quotes` (every BRiSK
   quote field); and the OHLCV bars `ohlcv-1s`, `ohlcv-1m`, `ohlcv-1h` and `ohlcv-1d`.
   `list_fields(schema)` lists a schema's columns.
@@ -729,7 +735,7 @@ recordings cover: the security, and the bar's whole span within the trading sess
 1-minute and 1-hour bars but not the day bar. So uploading is how you get bars. No one else's
 uploads enter yours, and yours enter no one else's. (`XTKS.BRISKDEMO`'s bars are built from
 the demo's own trades.) See [PRIVACY.md](https://github.com/honvl/BRiSKapi/blob/main/PRIVACY.md)
-(policy version 8).
+(policy version 10).
 `Ticker.candles()` is something else: BRiSK's own bars from your broker, which need a broker
 login.
 

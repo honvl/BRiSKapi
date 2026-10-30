@@ -673,12 +673,14 @@ test('the fast lane writes the subscribed symbols of each frame at once, as the 
   // The joined symbol's state is the recording's last quote of it up to the join's batch.
   let last = lines[1].quotes.find(q => q.issue_id === softbank);
   for (const [seq, b] of recording) if (seq <= join.seq) last = b.quotes.find(q => q.issue_id === softbank) ?? last;
+  // The recording's quotes also say what of their books changed (book_changes); the fast lane's, read for Live, do not.
+  const plainQuote = ({ book_changes, ...q }) => (assert.ok(Array.isArray(book_changes)), q);
   assert.deepEqual(join.codes, ['9984']);
-  assert.deepEqual(join.quotes, [last]);
+  assert.deepEqual(join.quotes, [plainQuote(last)]);
   for (const f of fastLines) {
     const wanted = new Set([master.get('7203'), master.get('6758'), ...(f.seq > join.seq ? [softbank] : [])]);
     const b = recording.get(f.seq);
-    assert.deepEqual(f.quotes, b.quotes.filter(q => wanted.has(q.issue_id)), `batch ${f.seq}`);
+    assert.deepEqual(f.quotes, b.quotes.filter(q => wanted.has(q.issue_id)).map(plainQuote), `batch ${f.seq}`);
     assert.deepEqual(f.trades, b.trades.filter(t => wanted.has(t.issue_id)), `batch ${f.seq}`);
     assert.equal(f.source_time_us, b.source_time_us);
   }

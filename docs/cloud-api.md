@@ -108,6 +108,7 @@ the columns a Databento user expects. Every schema but the bars starts with `ts_
 | --- | --- | --- |
 | `trades` | `data/trades.parquet` | `action` T; price, size; `side` from the aggressor (`B` buyer-initiated, `A` seller-initiated, `N` otherwise, as for most opening prints); `sequence` = frame; `trade_id` |
 | `mbp-10` | `data/order_book_depths.parquet` | Each quote update is the ten best levels per side after it, flattened to `bid_px_00`, `bid_sz_00`, `bid_ct_00` … `ask_ct_09` (null past a side's last level). BRiSK gives the book, not the order that changed it, so `action` and `side` are `N`, `depth` is 0, `price` null and `size` 0. The bootstrap batch's rows carry the snapshot flag (`flags` 32). |
+| `book-deltas` | `data/order_book_depths.parquet`'s `changes` and `checkpoint` | Every price level of both books (bid and ask, regular and closing-condition), all day, as Databento's MBO records at price-level grain (BRiSK has no order IDs): `action` `A` a level appears, `M` it changes, `C` it empties, `R` a security's books are cleared before a snapshot; `side`, `closing`, `price`, `size` and `count` (orders) after the event; `flags` 128 on an update's last record, 32 on a snapshot's. A security's first update in a recording is a snapshot (`R` then its levels). For each request the engine finds each security's last checkpoint before `start` (the packager writes its whole books every 1,000 changes) from row-group statistics and the checkpoint column, replays at most that many changes, and returns the records in range; `snapshot=true` puts each security's books as of `start` first. Overlapping recordings of a day are not merged (each one's changes are from its own previous update): the longest is read. Broker recordings from 1.9 on; none for the demo. |
 | `imbalance` | the auction fields | BRiSK's strength: per update an opening (`O`) row where the opening indicative price shows and a closing (`C`) row where the closing one does, in `auction_type`. `ind_match_price` = indicative price, `paired_qty` = indicative volume, `market_imbalance_qty`/`_side` = market buy minus sell, `bid_total_qty`/`ask_total_qty` = the board totals (the closing ones for `C`), collars = the day's limit prices, `auction_time` = special-quote timer. |
 | `definition` | `data/equity.parquet` | One row per security per recording, stamped JST midnight of its trading day: code, name, lot size, tick increment, base price, limits, issue and tick types |
 | `brisk-quotes` (ours) | depths, all columns | Everything BRiSK records for each update: closing-condition books, board totals, special-quote time (decimals as float64) |
@@ -300,9 +301,14 @@ client.timeseries.get_snapshot("XTKS.BRISK", at="2026-10-13T08:59:58", schema="b
   record since `since` (default: the JST midnight of `at`'s trading day) is absent. During the session
   pass a later `since`, or the search reads the morning.
 - A demo replay has no receipt clock: its `ts_recv` is its `ts_event`, so both filters agree there.
+- `get_range(..., schema="book-deltas", snapshot=True)` (the form's `snapshot=true`) begins with each
+  security's whole books as of `start`; `get_snapshot(dataset, at, symbols, schema="book-deltas")`
+  returns those alone (a clear and the levels, flagged 32), by BRiSK's stamp, rebuilt server-side
+  from each security's last checkpoint: `since` does not apply.
 
 On the command line, `brisk query XTKS.BRISK --schema ohlcv-1m --symbols 7203 --start 2026-10-13`
-writes CSV to stdout (`--encoding json|parquet`, `--output FILE`, `--end`, `--limit`). Over
+writes CSV to stdout (`--encoding json|parquet`, `--output FILE`, `--end`, `--limit`, and for
+`book-deltas` `--snapshot`). Over
 plain HTTP, `-L` follows the 303 for a large result and curl drops the key on the way:
 
 ```sh

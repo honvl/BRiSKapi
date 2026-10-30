@@ -22,8 +22,11 @@ use crate::error::{Failure, Res};
 use crate::files;
 use crate::master;
 use crate::parts::PartTable;
+use crate::replay::{IssueState, Lists, Rows};
 use crate::require;
-use crate::schema::{self, BATCHES, DEPTHS, EQUITY, F_MBP, F_SNAPSHOT, SKIPPED, TRADES};
+use crate::schema::{
+    self, BATCHES, CHANGES, CHECKPOINT, DEPTHS, EQUITY, F_MBP, F_SNAPSHOT, SKIPPED, TRADES,
+};
 use crate::sink::{Sink, Stage};
 use crate::sizes::{line_length, quote_bytes, trade_bytes};
 use crate::writer;
@@ -306,6 +309,56 @@ fn trade_ids(batch: &RecordBatch) -> Res<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
+/// One issue's rows of a range, walked in order: the rows with their checkpoints (if `write`), and the row the next piece
+/// starts from, the last with its issue's whole books as its changes.
+struct Walked {
+    rows: Vec<RecordBatch>,
+    last: RecordBatch,
+}
+
+fn walk_issue(sources: &[(usize, RecordBatch)], runs: &[Run], write: bool) -> Res<Walked> {
+    let mut state = IssueState::default();
+    let mut rows_out = Vec::with_capacity(runs.len());
+    let mut last = None;
+    for run in runs {
+        let rows = sources[run.batch].1.slice(run.start, run.len);
+        let mut points = Lists::new();
+        {
+            let view = Rows::new(&rows)?;
+            for i in 0..rows.num_rows() {
+                let point = state.apply(&view, i)?;
+                if write {
+                    if point {
+                        points.books(&state.books);
+                    } else {
+                        points.null();
+                    }
+                }
+            }
+        }
+        rows_out.push(if write {
+            replace(&rows, CHECKPOINT, points.finish()?)?
+        } else {
+            rows.clone()
+        });
+        last = Some(rows);
+    }
+    let last = last.expect("an issue has rows");
+    let last = last.slice(last.num_rows() - 1, 1);
+    let mut whole = Lists::new();
+    whole.books(&state.books);
+    let last = replace(&last, CHANGES, whole.finish()?)?;
+    let last = replace(
+        &last,
+        CHECKPOINT,
+        new_null_array(&schema::changes_type(), 1),
+    )?;
+    Ok(Walked {
+        rows: rows_out,
+        last,
+    })
+}
+
 fn trace(label: &str, since: &std::time::Instant) {
     if std::env::var_os("BRISK_PARQUET_TRACE").is_some() {
         let rss = std::process::Command::new("ps")
@@ -396,6 +449,20 @@ pub fn package_with(config: &Config, progress: &(dyn Fn(&str) + Sync)) -> Res<Ou
         .map(|p| PartTable::open(p, TRADES))
         .collect::<Res<_>>()?;
 
+    // Whether the quotes have book changes: all the parts' do, or none (a part with no quotes does not say).
+    let mut changes = None::<bool>;
+    let mut agree = |found: bool| -> Res<()> {
+        require!(
+            changes.is_none_or(|before| before == found),
+            "Quotes with and without book changes"
+        );
+        changes = Some(found);
+        Ok(())
+    };
+    for table in depth_tables.iter().filter(|t| t.rows() > 0) {
+        agree(table.changes)?;
+    }
+
     // The plan: the batches' kinds and how many quotes and trades each holds, from the small tables; where the piece starts and
     // ends, and the end it needs.
     trace("opened", &started);
@@ -483,6 +550,7 @@ pub fn package_with(config: &Config, progress: &(dyn Fn(&str) + Sync)) -> Res<Ou
             if batches.is_empty() {
                 None
             } else {
+                agree(table.changes)?;
                 Some(
                     arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
                         .map_err(Failure::from)?,
@@ -588,6 +656,7 @@ pub fn package_with(config: &Config, progress: &(dyn Fn(&str) + Sync)) -> Res<Ou
         )?))
     };
 
+    let changes = changes.unwrap_or(false);
     let (mut depths_sink, mut trades_sink, mut batches_sink) = (None, None, None);
     if let Some(out) = &config.out {
         std::fs::create_dir_all(out)?;
@@ -599,6 +668,7 @@ pub fn package_with(config: &Config, progress: &(dyn Fn(&str) + Sync)) -> Res<Ou
         batches_sink = Some(Sink::create(
             out,
             BATCHES,
+            schema::expected(BATCHES, false),
             schema::ROW_GROUP,
             pool.clone(),
             Stage::plain(),
@@ -607,6 +677,7 @@ pub fn package_with(config: &Config, progress: &(dyn Fn(&str) + Sync)) -> Res<Ou
         depths_sink = Some(Sink::create(
             out,
             DEPTHS,
+            schema::depths(changes),
             schema::ROW_GROUP,
             pool.clone(),
             Stage {
@@ -617,6 +688,7 @@ pub fn package_with(config: &Config, progress: &(dyn Fn(&str) + Sync)) -> Res<Ou
         trades_sink = Some(Sink::create(
             out,
             TRADES,
+            schema::expected(TRADES, false),
             schema::ROW_GROUP,
             pool.clone(),
             Stage {
@@ -776,14 +848,43 @@ pub fn package_with(config: &Config, progress: &(dyn Fn(&str) + Sync)) -> Res<Ou
             );
         }
         let mut last_of: Vec<RecordBatch> = Vec::new();
-        for (i, run) in all.iter().enumerate() {
-            let rows = sources[run.batch].1.slice(run.start, run.len);
-            if all.get(i + 1).is_none_or(|next| next.issue != run.issue) {
-                last_of.push(rows.slice(rows.num_rows() - 1, 1));
+        if changes {
+            // Each issue's rows are walked on their own (its books replayed, its checkpoints told), issues on the pool at once.
+            let mut issues: Vec<&[Run]> = Vec::new();
+            let mut from = 0;
+            for i in 1..=all.len() {
+                if i == all.len() || all[i].issue != all[from].issue {
+                    issues.push(&all[from..i]);
+                    from = i;
+                }
             }
-            if let Some(sink) = depths_sink.as_mut() {
-                quotes_done += rows.num_rows() as u64;
-                sink.push(rows)?;
+            let write = depths_sink.is_some();
+            let walked: Vec<Res<Walked>> = pool.install(|| {
+                issues
+                    .par_iter()
+                    .map(|runs| walk_issue(&sources, runs, write))
+                    .collect()
+            });
+            for item in walked {
+                let item = item?;
+                if let Some(sink) = depths_sink.as_mut() {
+                    for rows in item.rows {
+                        quotes_done += rows.num_rows() as u64;
+                        sink.push(rows)?;
+                    }
+                }
+                last_of.push(item.last);
+            }
+        } else {
+            for (i, run) in all.iter().enumerate() {
+                let rows = sources[run.batch].1.slice(run.start, run.len);
+                if all.get(i + 1).is_none_or(|next| next.issue != run.issue) {
+                    last_of.push(rows.slice(rows.num_rows() - 1, 1));
+                }
+                if let Some(sink) = depths_sink.as_mut() {
+                    quotes_done += rows.num_rows() as u64;
+                    sink.push(rows)?;
+                }
             }
         }
         pace.rows("quotes", quotes_done, quotes_total);
@@ -842,7 +943,8 @@ pub fn package_with(config: &Config, progress: &(dyn Fn(&str) + Sync)) -> Res<Ou
     trace("tables closed", &started);
     // The book after the piece, for the next one.
     if let Some(path) = &config.state_out {
-        let mut file = writer::create_file(path, DEPTHS, schema::ROW_GROUP)?;
+        let mut file =
+            writer::create_file(path, DEPTHS, schema::depths(changes), schema::ROW_GROUP)?;
         for batch in &latest {
             file.write(batch).map_err(fault)?;
         }

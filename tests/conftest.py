@@ -38,6 +38,16 @@ def untold(monkeypatch):
     monkeypatch.setattr(cli, '_told', False)
 
 
+@pytest.fixture
+def checkpoints(monkeypatch):
+    """A checkpoint after every few book changes of an issue (a recording's holds one after a thousand), in Python and in
+    brisk-parquet, which has the number from the environment (a hidden setting: BRISK_PARQUET_CHECKPOINT_CHANGES)."""
+    from briskapi import _parquet, schema
+    monkeypatch.setattr(schema, 'CHECKPOINT_CHANGES', 4)
+    monkeypatch.setattr(_parquet, 'CHECKPOINT_CHANGES', 4)
+    monkeypatch.setenv('BRISK_PARQUET_CHECKPOINT_CHANGES', '4')
+
+
 def _program_missing():
     """Why brisk-parquet cannot be run, or None."""
     try:

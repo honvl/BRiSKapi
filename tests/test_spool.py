@@ -18,8 +18,21 @@ from briskapi import _live, _native, _parquet, _spool
 OPEN_US = 9 * 3600 * 10**6
 
 
-def session(frames=40, source='brisk_live'):
-    """A broker session of two issues: books, trades in every third batch, a history batch, a skipped issue."""
+def with_book_changes(batches):
+    """The batches with each quote's `book_changes`, as a broker's decoder gives them, the lists the quote shows taken as the
+    issue's whole books (the first of an issue holds them whole)."""
+    before = {}
+    for batch in batches:
+        for q in batch.get('quotes', ()):
+            now = [q[name] for name in schema.BOOKS]
+            q[schema.BOOK_CHANGES] = schema.book_changes(before.get(q['issue_id']), now)
+            before[q['issue_id']] = now
+    return batches
+
+
+def session(frames=40, source='brisk_live', changes=False):
+    """A broker session of two issues: books, trades in every third batch, a history batch, a skipped issue. With `changes`,
+    its quotes have book changes."""
     executed = {0: [0, 0], 1: [0, 0]}   # the trades so far account for each quote's volume and turnover
 
     def quote(issue, code, i, now):
@@ -49,8 +62,9 @@ def session(frames=40, source='brisk_live'):
         if i == 7:
             b['quotes'], b['skipped_issues'] = b['quotes'][1:], [1]
         batches.append(b)
-    return batches + [dict(type='end', seq=frames + 2, source_time_us=now, frames=frames + 2,
-                           quote_updates=2 * frames - 1, replay_wall_ms=4_000.0)]
+    batches += [dict(type='end', seq=frames + 2, source_time_us=now, frames=frames + 2,
+                     quote_updates=2 * frames - 1, replay_wall_ms=4_000.0)]
+    return with_book_changes(batches) if changes else batches
 
 
 def lines(batches):
@@ -69,12 +83,12 @@ def small_parts(monkeypatch):
     monkeypatch.setattr(_spool, 'PART_BYTES', _spool.PART_BYTES)
 
 
-def many_parts(tmp_path, count, root=None):
+def many_parts(tmp_path, count, root=None, changes=False):
     """A segment of `count` batches spooled a batch to a part, as a day of ten thousand updates a second is (a part every few
     seconds): its bootstrap through Spool.add, the other parts written by brisk-parquet on a few threads at once, and the spool
     reopened as a recovered one is. The paths of the parts, listed, run to more than a Windows command line holds."""
     from concurrent.futures import ThreadPoolExecutor
-    batches = session(frames=count - 3)
+    batches = session(frames=count - 3, changes=changes)
     _spool.PART_BYTES, spool = 1, _spool.Spool(root=root or tmp_path / ('spool-' + 'x' * 40))
     spool.add(batches[0], lines(batches)[0])
     spool.close_part(wait=True)
@@ -84,7 +98,7 @@ def many_parts(tmp_path, count, root=None):
         list(pool.map(lambda n: _native.part([every[n]], spool.path / 'parts' / f'{n + 1:06d}', midnight), range(1, len(batches))))
     spool._writer.shutdown()
     spool = _spool.Spool.reopen(spool.path)
-    assert len(spool.parts()) == len(batches) == count and sum(len(str(p)) + 1 for p in spool.parts()) > 32_767
+    assert len(spool.parts()) == len(batches) == count and (count < 100 or sum(len(str(p)) + 1 for p in spool.parts()) > 32_767)
     return spool, batches
 
 
@@ -99,9 +113,11 @@ def same_tables(left, right, names=_parquet.FILES):
         assert a.equals(b), name
 
 
-def test_a_spooled_segment_packages_to_the_same_tables_as_its_batches_at_once(tmp_path):
-    # The package's summary is counted as it is written, and must be the one the archive's checks give (cli.package's).
-    batches = session()
+@pytest.mark.parametrize('changes', [False, True], ids=['plain', 'book changes'])
+def test_a_spooled_segment_packages_to_the_same_tables_as_its_batches_at_once(tmp_path, changes, checkpoints):
+    # The package's summary is counted as it is written, and must be the one the archive's checks give (cli.package's). With
+    # book changes, its checkpoints are where Python puts them.
+    batches = session(changes=changes)
     (tmp_path / 'events.jsonl').write_bytes(b''.join(lines(batches)))
     whole = cli.package(tmp_path / 'events.jsonl', tmp_path / 'whole')
     spool = spooled(tmp_path, batches)
@@ -111,6 +127,10 @@ def test_a_spooled_segment_packages_to_the_same_tables_as_its_batches_at_once(tm
     assert parts['summary'] == whole['summary']
     same_tables(tmp_path / 'parts', tmp_path / 'whole')
     assert _parquet.inspect_package(tmp_path / 'parts', parts) == parts['summary']   # and the archive takes it
+    held = pq.read_table(tmp_path / 'parts' / _parquet.DEPTHS)
+    assert ('checkpoint' in held.column_names) == changes
+    if changes:
+        assert 0 < held.column('checkpoint').null_count < len(held), 'some rows are checkpoints, most are not'
     spool.remove()
     assert not spool.path.exists()
 
@@ -125,9 +145,10 @@ def test_parts_hold_no_connection_diagnostics(tmp_path):
     assert json.loads(first) == schema.BROKER_TRANSPORTS['sbi']
 
 
+@pytest.mark.parametrize('changes', [False, True], ids=['plain', 'book changes'])
 @pytest.mark.parametrize('count', [0, 1, 7, 30, 43])
-def test_a_replay_gives_exactly_the_first_lines(tmp_path, count):
-    batches = session()
+def test_a_replay_gives_exactly_the_first_lines(tmp_path, count, changes):
+    batches = session(changes=changes)
     spool = spooled(tmp_path, batches)
     canonical = [schema.canonical(b) for b in schema.canonical_batches(__import__('io').BytesIO(b''.join(lines(batches))))]
     replay = spool.replay(count)

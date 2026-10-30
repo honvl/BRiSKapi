@@ -37,7 +37,8 @@ import pyarrow.parquet as pq
 from briskapi import _parquet
 from briskapi._parquet import BOOKS, COUNTS, DEPTHS, PRICES, ROW_GROUP, TRADES
 from briskapi._recording import micros
-from briskapi.schema import require, site_of
+from briskapi.schema import book_changes, require, site_of
+from briskapi.records import _levels
 
 SAME, CONFLICT, ONLY, OUTSIDE, SNAPSHOT = range(5)
 CLASSES = ('same', 'conflict', 'only', 'outside', 'snapshot')
@@ -231,7 +232,8 @@ class Tally:
 
 
 class Gaps:
-    """What repair adds, security by security: the other's rows (Arrow tables, with their batches' numbers); and what it leaves."""
+    """What repair adds, security by security: the other's rows (Arrow tables, their whole books with book changes, and their
+    batches' numbers); and what it leaves."""
 
     def __init__(self):
         self.quotes, self.trades, self.joined, self.recorded = {}, {}, {}, set()
@@ -239,14 +241,14 @@ class Gaps:
 
     def batches(self):
         """The other's batches that hold any of the rows added in a batch of their own, in order."""
-        return sorted({int(s) for tables in (self.quotes, self.trades) for _, seq in tables.values() for s in seq})
+        return sorted({int(s) for tables in (self.quotes, self.trades) for _, _, seq in tables.values() for s in seq})
 
     def keys(self):
         """The batches the joined updates go in, each as the key `after * RANKS + rank`: the batch of the recording they come before, and
         their place in the run of one security's updates that come before it."""
         if not self.joined:
             return np.zeros(0, np.int64)
-        return np.unique(np.concatenate([after * RANKS + rank for _, after, rank, _ in self.joined.values()]))
+        return np.unique(np.concatenate([after * RANKS + rank for _, _, after, rank, _ in self.joined.values()]))
 
     def count(self, tables):
         return sum(len(rows) for rows, *_ in tables.values())
@@ -290,6 +292,44 @@ def fit(a, b, candidates, a_clock, b_clock, lo, hi, joining=False):
     return own, join, rank, int((inside & ~(alone | joins)).sum()), int((~inside).sum())
 
 
+# Book changes: each recording's are from its own previous quote, so a quote added from the other recording, and the
+# recording's next one, have them again from the books themselves: each row's whole books (`_whole`, replayed in its own
+# recording) go along with it, and once a security's rows are merged its changes are what changed from row to row.
+
+def whole_books(table):
+    """Each row's whole books (four [price10, quantity, orders] lists, each best first), a security's rows replayed from
+    its first."""
+    books, out = [{} for _ in BOOKS], []
+    for changes in _levels(table.column('changes')):
+        for book, price, quantity, orders in changes:
+            if quantity:
+                books[book][price] = [quantity, orders]
+            else:
+                books[book].pop(price, None)
+        out.append([[[price, *books[k][price]] for price in sorted(books[k], reverse=k % 2 == 0)] for k in range(len(BOOKS))])
+    return out
+
+
+def rechanged(table, whole):
+    """A security's merged rows with their changes from row to row (`whole`: each row's books) and their checkpoints."""
+    changes, points, count, before = [], [], 0, None
+    for books in whole:
+        changes.append(book_changes(before, books))
+        count = 0 if before is None else count + len(changes[-1])   # the first row holds the books whole
+        before = books
+        if before is not None and count >= _parquet.CHECKPOINT_CHANGES:
+            points.append([[k, *level] for k, side in enumerate(books) for level in side])
+            count = 0
+        else:
+            points.append(None)
+    lists = lambda rows: (np.concatenate([[0], np.cumsum([len(r or ()) for r in rows])]),   # noqa: E731
+                          np.array([level for r in rows for level in (r or ())], np.int64).reshape(-1, 4))
+    table = table.set_column(table.schema.get_field_index('changes'), table.schema.field('changes'),
+                             _parquet._change_list(*lists(changes)))
+    return table.set_column(table.schema.get_field_index('checkpoint'), table.schema.field('checkpoint'),
+                            _parquet._change_list(*lists(points), [p is None for p in points]))
+
+
 def gather(gaps, kind, issue, a, b, b_class, side_a, side_b, hi):
     """Add this security's rows from b that a lacks, as repair would: b's ONLY rows (classified against a's range extended to `hi`)
     that fit among a's, each in a batch of its own: a quote update that a later one of its security follows in a, just before the
@@ -310,12 +350,14 @@ def gather(gaps, kind, issue, a, b, b_class, side_a, side_b, hi):
     join[early] = -1
     gaps.left['misplaced'] += misplaced + int(early.sum())
     gaps.left['after_end'] += outside
+    whole = whole_books(b.table) if kind == 'quotes' and 'changes' in b.table.column_names else None
+    rows = lambda take: (b.table.take(pa.array(take)), whole and [whole[i] for i in take])   # noqa: E731
     if own.any():
         take = np.flatnonzero(own)
-        (gaps.quotes if kind == 'quotes' else gaps.trades)[issue] = (b.table.take(pa.array(take)), b.seq[take])
+        (gaps.quotes if kind == 'quotes' else gaps.trades)[issue] = (*rows(take), b.seq[take])
     if (join >= 0).any():
         take = np.flatnonzero(join >= 0)
-        gaps.joined[issue] = (b.table.take(pa.array(take)), join[take], rank[take], b.time[take])
+        gaps.joined[issue] = (*rows(take), join[take], rank[take], b.time[take])
 
 
 def scan(a, b, window, snapshots=True, until=None):
@@ -345,7 +387,7 @@ def twins(a, gaps):
     keys = gaps.keys()
     if not len(keys):
         return keys, keys, keys
-    key = np.concatenate([after * RANKS + rank for _, after, rank, _ in gaps.joined.values()])
+    key = np.concatenate([after * RANKS + rank for _, _, after, rank, _ in gaps.joined.values()])
     time = np.concatenate([time for *_, time in gaps.joined.values()])
     latest = np.zeros(len(keys), np.int64)
     np.maximum.at(latest, np.searchsorted(keys, key), time)
@@ -375,8 +417,9 @@ def renumber(a, b, seqs, before=(), clocks=()):
 class Writer:
     """A table written in row groups of ROW_GROUP rows, as the canonical encoding has them, from tables of any size."""
 
-    def __init__(self, path, name):
-        self.writer = pq.ParquetWriter(path, _parquet.SCHEMAS[name], **_parquet.options(name))
+    def __init__(self, path, name, changed=False):
+        schema = _parquet.DEPTH_CHANGES_SCHEMA if changed else _parquet.SCHEMAS[name]
+        self.writer = pq.ParquetWriter(path, schema, **_parquet.options(name))
         self.pending, self.rows = [], 0
 
     def add(self, table):
@@ -412,17 +455,23 @@ def with_issues(chunks, extra):
         yield issue, None
 
 
-def merged(table, seq, extra):
+def merged(table, seq, extra, whole=None):
     """A security's rows (`table`, or None for none, in batches `seq` already renumbered) with the other's rows among them: `extra`
-    is a list of (rows, their batches' new numbers), in batch order."""
+    is a list of (rows, their whole books or None, their batches' new numbers), in batch order; `whole`, the security's own rows'
+    whole books, where the recording has book changes (then the merged rows' changes are from row to row)."""
+    changed = whole is not None or any(more is not None for _, more, _ in extra)
+    added, books = bool(extra), list(whole or []) if changed else None
     if table is None:
-        table, seq = extra[0]
-        extra = extra[1:]
+        table, first, seq = extra[0]
+        books, extra = (list(first) if changed else None), extra[1:]
     if extra:
-        table, seq = pa.concat_tables([table, *(rows for rows, _ in extra)]), np.concatenate([seq, *(new for _, new in extra)])
+        table, seq = pa.concat_tables([table, *(rows for rows, _, _ in extra)]), np.concatenate([seq, *(new for _, _, new in extra)])
+        books = None if books is None else books + [b for _, more, _ in extra for b in more]
         order = np.argsort(seq, kind='stable')
         table, seq = table.take(pa.array(order)), seq[order]
-    return table.set_column(table.schema.get_field_index('seq'), table.schema.field('seq'), pa.array(seq, pa.uint64()))
+        books = None if books is None else [books[i] for i in order]
+    table = table.set_column(table.schema.get_field_index('seq'), table.schema.field('seq'), pa.array(seq, pa.uint64()))
+    return rechanged(table, books) if changed and added else table
 
 
 def write(a, b, gaps, output):
@@ -435,15 +484,19 @@ def write(a, b, gaps, output):
     numbers = np.zeros(nb + len(keys), np.int64)
     for seq, new in added.items():
         numbers[seq] = new
+    changed = 'changes' in pq.read_schema(a.directory / DEPTHS).names
+    require(changed == ('changes' in pq.read_schema(b.directory / DEPTHS).names),
+            'One recording has book changes (briskapi 1.9 or later) and the other has not: repair each with one of its kind')
     for source, tables, joins in ((DEPTHS, gaps.quotes, gaps.joined), (TRADES, gaps.trades, {})):
-        writer = Writer(output / source, source)
+        writer = Writer(output / source, source, changed and source == DEPTHS)
         try:
             for issue, table in with_issues(by_issue(a.directory / source), {*tables, *joins}):
-                extra = [(rows, numbers[seqs]) for rows, seqs in [tables[issue]]] if issue in tables else []
+                extra = [(rows, whole, numbers[seqs]) for rows, whole, seqs in [tables[issue]]] if issue in tables else []
                 if issue in joins:
-                    rows, after, rank, _ = joins[issue]
-                    extra.append((rows, numbers[nb + np.searchsorted(keys, after * RANKS + rank)]))
-                writer.add(merged(table, None if table is None else kept[table.column('seq').to_numpy()], extra))
+                    rows, whole, after, rank, _ = joins[issue]
+                    extra.append((rows, whole, numbers[nb + np.searchsorted(keys, after * RANKS + rank)]))
+                own = whole_books(table) if changed and source == DEPTHS and table is not None else None
+                writer.add(merged(table, None if table is None else kept[table.column('seq').to_numpy()], extra, own))
         except BaseException:
             writer.writer.close()
             raise

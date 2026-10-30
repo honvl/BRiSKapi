@@ -50,6 +50,8 @@ pub struct Span {
 
 pub struct PartTable {
     path: PathBuf,
+    /// A depths table whose quotes have book changes. (A part with no quotes has none: it does not know.)
+    pub changes: bool,
     options: ArrowReaderOptions,
     pub spans: Vec<Span>,
     file_len: u64,
@@ -213,13 +215,17 @@ impl PartTable {
         };
         let reader = ArrowReaderMetadata::load(&region, options.clone())?;
         let found = reader.schema();
-        require!(
+        let like = |expected: &arrow_schema::Schema| {
             found.fields().len() == expected.fields().len()
                 && found
                     .fields()
                     .iter()
                     .zip(expected.fields())
-                    .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type()),
+                    .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
+        };
+        let changes = name == schema::DEPTHS && !like(&expected) && like(&schema::depths(true));
+        require!(
+            changes || like(&expected),
             format!("Unexpected schema in {name}")
         );
         let meta = reader.metadata();
@@ -266,6 +272,7 @@ impl PartTable {
         );
         Ok(PartTable {
             path,
+            changes,
             options,
             spans,
             file_len,

@@ -344,7 +344,8 @@ async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImp
   // Asked to stop (see main), the session ends its day here, as the day's end would: a recording to keep and upload.
   if (stop) stop.end = endDay;
   const stale = staleSeconds ? staleDataCheck({ date: app.date, thresholdUs: staleSeconds * 1e6, name: where.name }) : null;
-  const decoder = await Decoder.create(assets, { protocolVersion, check: checkAbi,
+  // Its quotes are the recording's (without quote workers, and every session's bootstrap): each says what of its books changed.
+  const decoder = await Decoder.create(assets, { protocolVersion, bookChanges: true, check: checkAbi,
     checkMaster: master => checkMaster(master, protocolVersion), schedule: app.schedule_info ?? null,
     boot: { exceptional_sq: app.exceptional_sq, base_prices: app.base_prices }, callbacks: {
     send: bytes => { if (link) link.send(bytes); },
@@ -564,7 +565,8 @@ async function live({ cookies, codes = [], emit, fetchImpl = fetch, WebSocketImp
     const count = budget > 0 ? Math.max(1, budget - fastCount) : 0;
     const options = { protocolVersion, schedule: app.schedule_info ?? null,
       boot: { exceptional_sq: app.exceptional_sq, base_prices: app.base_prices } };
-    const launched = await Promise.allSettled([count ? QuotePool.start({ assets, ids, count, options }) : null,
+    // The recording's workers say what of each quote's books changed; the fast lane's quotes go to Live, which needs none.
+    const launched = await Promise.allSettled([count ? QuotePool.start({ assets, ids, count, options: { ...options, bookChanges: true } }) : null,
       fastCount ? QuotePool.start({ assets, ids, count: fastCount, options }) : null]);
     [pool, fastPool] = launched.map(r => (r.status === 'fulfilled' ? r.value : null));   // closed below, either way
     const unlaunched = launched.find(r => r.status === 'rejected');

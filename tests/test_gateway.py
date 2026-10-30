@@ -62,26 +62,31 @@ def test_live_records_are_the_cloud_apis(archive, decoder):
     """Replayed from the day's start, then live: every schema's records, bars included, equal the cloud API's for
     that session."""
     s3, _, put = archive
-    batches = session(0, 150)
+    batches = session(0, 150, changes=True)
     put(batches)
     script, release = decoder(batches, holds=[70])
     feed = broker_feed(script)
     wait_for(lambda: feed.seq == 69)
-    whole, part = brisk.Live(), brisk.Live()
+    whole, part, books = brisk.Live(), brisk.Live(), brisk.Live()
     for schema in records.SCHEMAS:
         whole.subscribe(dataset='XTKS.BRISK', schema=schema, start=0)
     part.subscribe(dataset='XTKS.BRISK', schema='trades', symbols=['167A'], start=at(25))
+    # The books as of a time, then what changed: the cloud's get_range(snapshot=True).
+    books.subscribe(dataset='XTKS.BRISK', schema='book-deltas', symbols=['7203'], start=at(25), snapshot=True)
     got = collections.defaultdict(list)
     whole.add_callback(lambda r: got[r.schema].append(dict(r)))
     whole.start()
-    later = []
+    later, snapped = [], []
     reader = threading.Thread(target=lambda: later.extend(part))
     reader.start()
-    # Both subscriptions answered before the feed goes on: one that came after the day's end would get nothing.
-    wait_for(lambda: len(feed.gateway._clients) == 2 and all(c.known is not None for c in feed.gateway._clients))
+    snapper = threading.Thread(target=lambda: snapped.extend(books))
+    snapper.start()
+    # Every subscription answered before the feed goes on: one that came after the day's end would get nothing.
+    wait_for(lambda: len(feed.gateway._clients) == 3 and all(c.known is not None for c in feed.gateway._clients))
     release(70)
     whole.block_for_close(timeout=30)
     reader.join(30)
+    snapper.join(30)
     feed.wait()
     for schema in records.SCHEMAS:
         expected = query(s3, OWNER, dataset='XTKS.BRISK', schema=schema, start='2026-10-13').to_pylist()
@@ -90,6 +95,9 @@ def test_live_records_are_the_cloud_apis(archive, decoder):
     expected = query(s3, OWNER, dataset='XTKS.BRISK', schema='trades', symbols='167A', start=at(25)).to_pylist()
     assert expected and [dict(r) for r in later] == expected
     assert later[0].schema == 'trades' and later[0].price == later[0]['price'] and later[0].symbol == '167A'
+    expected = query(s3, OWNER, dataset='XTKS.BRISK', schema='book-deltas', symbols='7203', start=at(25), snapshot=True).to_pylist()
+    assert expected[0]['action'] == 'R' and expected[0]['flags'] & 32 and expected[0]['ts_event'] < dt.datetime.fromisoformat(at(25))
+    assert [dict(r) for r in snapped] == expected
     assert not whole.is_connected() and 'closed' in repr(whole) and list(whole) == []
     assert whole.symbology_map == {7203: '7203', 154694: '167A'}
 

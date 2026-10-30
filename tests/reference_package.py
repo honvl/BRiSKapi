@@ -15,11 +15,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from briskapi._parquet import (BATCH_SCHEMA, BATCHES, BOOKS, DEPTH_SCHEMA, DEPTHS, EQUITY, FILES, INTS, KINDS, PART_ISSUES,
+from briskapi._parquet import (BATCH_SCHEMA, BATCHES, BOOKS, DEPTH_CHANGES_SCHEMA, DEPTH_SCHEMA, DEPTHS, EQUITY, FILES, INTS, KINDS, PART_ISSUES,
                                ROW_GROUP, SCHEMAS, TRADE_SCHEMA, TRADES, Columns, _decode_batches, _decode_equity, _decode_trades,
                                _depth_rows, _no_trades, _numbers, _part_columns, _rows, batch_lengths,
                                midnight_ns, options, quote_lengths, trade_lengths)
-from briskapi.schema import SKIPPED, canonical_batches, require
+import briskapi.schema as schema
+from briskapi.schema import SKIPPED, apply_changes, canonical_batches, require
 
 class Cut(NamedTuple):
     """Where shipped pieces left the day: each issue's last quote (Columns) and the last batch's clock."""
@@ -77,7 +78,8 @@ def write_part(columns, header, directory, carry=None):
         pq.write_table(columns._batches(midnight), directory / BATCHES, row_group_size=ROW_GROUP, **options(BATCHES))
         rows = columns.sorted()
         issues = rows.q['issue_id']
-        with pq.ParquetWriter(directory / DEPTHS, DEPTH_SCHEMA, **options(DEPTHS)) as writer:
+        with pq.ParquetWriter(directory / DEPTHS, DEPTH_CHANGES_SCHEMA if rows.changes else DEPTH_SCHEMA,
+                              **options(DEPTHS)) as writer:
             # A row group per PART_ISSUES issue IDs, so that a piece of the day is read a range of issues at a time.
             starts = np.flatnonzero(np.diff(issues // PART_ISSUES, prepend=-1)) if len(issues) else np.zeros(1, np.int64)
             for start, stop in zip(starts.tolist(), [*starts[1:].tolist(), len(issues)]):
@@ -119,7 +121,7 @@ def latest(columns, before=None):
     if not rows:
         return before
     t, t_code = _no_trades()
-    both = Columns.concat([Columns(c.q, c.code, c.books, c.master, [], t, t_code) for c in rows], columns.master)
+    both = Columns.concat([Columns(c.q, c.code, c.books, c.master, [], t, t_code, changes=c.changes) for c in rows], columns.master)
     order = both.order
     issues = both.q['issue_id'][order]
     last = np.ones(len(order), bool)
@@ -142,11 +144,11 @@ def after(columns, cut, bootstrap):
     t, t_code = _no_trades()
     pieces = [Columns({**columns.q, 'seq': columns.q['seq'] - shift}, columns.code, columns.books, columns.master,
                       [dict(b, seq=b['seq'] - shift) for b in columns.batches], {**columns.t, 'seq': columns.t['seq'] - shift},
-                      columns.t_code)]
+                      columns.t_code, changes=columns.changes)]
     if cut.latest is not None:
         state = cut.latest
         pieces.insert(0, Columns({**state.q, 'seq': np.zeros(len(state), np.int64)}, state.code, state.books,
-                                 columns.master, [head], t, t_code))
+                                 columns.master, [head], t, t_code, changes=state.changes))
     else:
         pieces.insert(0, Columns({k: np.zeros(0, np.int64) for k in INTS}, np.zeros(0, dtype=object),
                                  {side: (np.zeros(1, np.int64), np.zeros((0, 3), np.int64)) for side in BOOKS},
@@ -163,6 +165,27 @@ def recount_end(columns):
 
 
 
+
+
+def whole_books(columns, order):
+    """The last row of each issue in `order` (rows in `order`, an issue's in batch order) as Columns of quotes alone, with
+    its changes the issue's whole books after it, each best first: the rows a piece after a cut starts from."""
+    offsets, levels = columns.changes
+    issues = columns.q['issue_id'][order]
+    last = np.ones(len(order), bool)
+    last[:-1] = issues[1:] != issues[:-1]
+    books, previous, counts, flat = None, None, [], []
+    for at, row in enumerate(order.tolist()):
+        if issues[at] != previous:
+            books, previous = [{} for _ in schema.BOOKS], issues[at]
+        apply_changes(books, levels[offsets[row]:offsets[row + 1]].tolist())
+        if last[at]:
+            whole = [[k, price, *books[k][price]] for k in range(len(schema.BOOKS)) for price in sorted(books[k], reverse=k % 2 == 0)]
+            counts.append(len(whole))
+            flat.extend(whole)
+    out = _rows(columns, order[last])
+    out.changes = np.concatenate([[0], np.cumsum(counts)]), np.array(flat, np.int64).reshape(-1, 4)
+    return out
 
 
 class _TableWriter:
@@ -349,7 +372,10 @@ def write_piece(equity, parts, directory, midnight, cut=None, bootstrap=None, en
         batch_writer.close()
         depth_spans, blocks = _layout(parts, DEPTHS)
         trade_spans, _ = _layout(parts, TRADES)
-        depths, trades = _TableWriter(directory / DEPTHS, DEPTH_SCHEMA, DEPTHS), _TableWriter(directory / TRADES, TRADE_SCHEMA, TRADES)
+        changed = (cut is not None and cut.latest is not None and cut.latest.changes is not None) or any(
+            'changes' in pq.read_schema(Path(part) / DEPTHS).names for part in parts)   # a part with no quotes says nothing
+        depths = _TableWriter(directory / DEPTHS, DEPTH_CHANGES_SCHEMA if changed else DEPTH_SCHEMA, DEPTHS)
+        trades = _TableWriter(directory / TRADES, TRADE_SCHEMA, TRADES)
         for low, high in _ranges(blocks):
             pieces = []
             for raw in _read_range(parts, depth_spans, DEPTHS, low, high, DECODE_ROWS):
@@ -367,16 +393,17 @@ def write_piece(equity, parts, directory, midnight, cut=None, bootstrap=None, en
                 pieces.insert(0, state)
             if pieces:
                 joined = pieces[0] if len(pieces) == 1 else Columns.concat(
-                    [Columns(r.q, r.code, r.books, master, [], *_no_trades()) for r in pieces], master)
+                    [Columns(r.q, r.code, r.books, master, [], *_no_trades(), changes=r.changes) for r in pieces], master)
                 del pieces, rows
                 order = joined.order if joined.order is not None else np.lexsort((joined.q['seq'], joined.q['issue_id']))
                 issues = joined.q['issue_id'][order]
                 newest = np.ones(len(issues), bool)
                 newest[:-1] = issues[1:] != issues[:-1]
-                latest.append(_rows(joined, order[newest]))
+                latest.append(whole_books(joined, order) if joined.changes else _rows(joined, order[newest]))
+                points = joined.checkpoints(order) if joined.changes else None
                 for start in range(0, len(order), ROW_GROUP):   # written a row group at a time: never whole as Arrow
                     ordered = _rows(joined, order[start:start + ROW_GROUP])
-                    depths.add(ordered._depths(midnight))
+                    depths.add(ordered._depths(midnight, points and points[start:start + ROW_GROUP]))
                     quote_bytes += int(quote_lengths(ordered).sum())
                     quote_rows += len(ordered)
                 del joined, order, issues
@@ -406,7 +433,7 @@ def write_piece(equity, parts, directory, midnight, cut=None, bootstrap=None, en
                    batches=total, quote_updates=quote_rows, expanded_bytes=expanded + quote_bytes + trade_bytes)
     state = None
     if latest:
-        state = Columns.concat([Columns(r.q, r.code, r.books, master, [], *_no_trades()) for r in latest], master)
+        state = Columns.concat([Columns(r.q, r.code, r.books, master, [], *_no_trades(), changes=r.changes) for r in latest], master)
         state = _rows(state, state.order)
     return summary, state, final['source_time_us'], repaired
 

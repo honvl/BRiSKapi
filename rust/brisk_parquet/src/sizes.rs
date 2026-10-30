@@ -117,6 +117,40 @@ pub fn quote_bytes(batch: &RecordBatch, midnight: i64) -> u64 {
             }
         }
     }
+    if let Some(list) = batch
+        .column_by_name(schema::CHANGES)
+        .and_then(|c| c.as_list_opt::<i32>())
+    {
+        bytes += changes_bytes(list);
+    }
+    bytes
+}
+
+/// The canonical JSON bytes a depths batch's quotes take for their book changes: the key and its comma, the list of
+/// [book, price10, quantity, orders], and the commas between its elements.
+pub fn changes_bytes(list: &arrow_array::ListArray) -> u64 {
+    let levels = list.values().as_struct();
+    let (book, price, size, count) = (
+        levels
+            .column(0)
+            .as_primitive::<arrow_array::types::UInt8Type>()
+            .values(),
+        levels.column(1).as_primitive::<Decimal128Type>().values(),
+        levels.column(2).as_primitive::<Decimal128Type>().values(),
+        levels.column(3).as_primitive::<UInt32Type>().values(),
+    );
+    let mut bytes = (schema::BOOK_CHANGES.len() as u64 + 4) * list.len() as u64;
+    for window in list.value_offsets().windows(2) {
+        let (lo, hi) = (window[0] as usize, window[1] as usize);
+        bytes += 2 + hi.saturating_sub(lo + 1) as u64;
+        for j in lo..hi {
+            bytes += digits(book[j] as u64)
+                + digits(tenths(price[j]).unwrap_or(0))
+                + digits(whole(size[j]).unwrap_or(0))
+                + digits(count[j] as u64)
+                + 5;
+        }
+    }
     bytes
 }
 

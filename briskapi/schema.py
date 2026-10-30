@@ -26,6 +26,17 @@ SOURCES = {'historical_mock', 'synthetic_test', 'brisk_live'}
 QUOTE_KEYS = set('issue_id code frame source_time_us max_frame last_price10 open_price10 bid_price10 ask_price10 indicative_price10 indicative_volume indicative_imbalance_side closing_indicative_price10 closing_indicative_volume closing_indicative_imbalance_side quote_flag quote_side special_quote_time_us indicative_open_price10 reference_price10 volume turnover10 issue_status market_buy_quantity market_sell_quantity closing_market_buy_quantity closing_market_sell_quantity bid_quantity bid_orders ask_quantity ask_orders bid_levels ask_levels bid_closing_levels ask_closing_levels bid_total_quantity bid_total_orders bid_closing_total_quantity bid_closing_total_orders ask_total_quantity ask_total_orders ask_closing_total_quantity ask_closing_total_orders'.split())
 # A side of the book (or of its closing-condition orders): up to LEVELS [price10, quantity, orders], best price first.
 BOOK_KEYS = {'bid_levels', 'ask_levels', 'bid_closing_levels', 'ask_closing_levels'}
+# A broker quote's whole books, as what changed since its security's previous quote in the recording (the first holds
+# them whole): [book, price10, quantity, orders], book the index in BOOKS, each book's best price first, and 0 shares
+# and 0 orders for a level that emptied. Replayed, the books' best LEVELS are the quote's own lists. A recording's
+# quotes all have it or (a broker's from before 1.9.0, a demo's) none.
+BOOK_CHANGES = 'book_changes'
+BOOKS = ('bid_levels', 'ask_levels', 'bid_closing_levels', 'ask_closing_levels')
+MAX_BOOK_LEVELS = 65536   # a book's nonempty levels, at most (a side spans fewer ticks between its daily limits)
+# A recording's tables also hold each issue's whole books (its depths table's `checkpoint`) after every CHECKPOINT_CHANGES
+# book changes since the last time (an issue's first quote holds them whole): reading its books at any moment
+# replays at most that many changes, never the day so far.
+CHECKPOINT_CHANGES = 1000
 # One execution, as the decoder records it: `side` is its raw type (1 buyer-initiated, 2 seller-initiated,
 # 0 most opening auction prints), `quantity` shares and `frame` the issue's frame number.
 TRADE_KEYS = set('issue_id code frame time_us price10 quantity side'.split())
@@ -110,6 +121,45 @@ def book(levels, descending):
     prices = [level[0] for level in levels]
     require(prices == sorted(set(prices), reverse=descending), 'Book prices out of order')
 
+def book_changes(before, after):
+    """What changed from the four books `before` (None: none yet) to `after`, as BOOK_CHANGES lists it. Each is
+    [price10, quantity, orders] levels, best first, in BOOKS order."""
+    out = []
+    for book, now in enumerate(after):
+        old = {level[0]: level for level in before[book]} if before else {}
+        new = {level[0]: level for level in now}
+        for price in sorted(old.keys() | new.keys(), reverse=book % 2 == 0):
+            if price not in new:
+                out.append([book, price, 0, 0])
+            elif old.get(price) != new[price]:
+                out.append([book, *new[price]])
+    return out
+
+def apply_changes(books, changes):
+    """Apply a quote's BOOK_CHANGES to `books` (four dicts, price10 to [quantity, orders]), in place."""
+    for book, price, quantity, orders in changes:
+        if quantity:
+            books[book][price] = [quantity, orders]
+        else:
+            require(books[book].pop(price, None) is not None, 'Book change empties a level the book does not have')
+
+def best(books, book, count=LEVELS):
+    """A book's best `count` levels (all with None), as a quote lists them."""
+    levels = sorted(books[book].items(), reverse=book % 2 == 0)[:count]
+    return [[price, quantity, orders] for price, (quantity, orders) in levels]
+
+def _changes(value):
+    """Check a quote's BOOK_CHANGES: each book's levels once, best first, an emptied level with 0 shares and orders."""
+    require(isinstance(value, list) and len(value) <= len(BOOKS) * MAX_BOOK_LEVELS, 'Invalid book changes')
+    last = None
+    for change in value:
+        require(isinstance(change, list) and len(change) == 4, 'Invalid book change')
+        book, price, quantity, orders = (integer(v) for v in change)
+        require(book < len(BOOKS) and price > 0 and (quantity == 0) == (orders == 0), 'Invalid book change')
+        require(last is None or book > last[0] or (book == last[0] and (price < last[1] if book % 2 == 0 else price > last[1])),
+                'Book changes out of order')
+        last = (book, price)
+
 def _nonfinite(_):
     raise ValueError('Nonfinite JSON')
 
@@ -192,7 +242,8 @@ def _scan(entries):
     `entries` yields (batch, line): a JSONL line must be the batch's canonical encoding, and
     batches decoded from another format pass None.
     """
-    identities, clocks, executed, offsets, executions, restored = {}, {}, {}, {}, {}, {}
+    identities, clocks, executed, offsets, executions, restored, books = {}, {}, {}, {}, {}, {}, {}
+    changed = None   # whether the recording's quotes have BOOK_CHANGES (a broker's from 1.9.0 on)
     fingerprint = Fingerprint()
     seq = last = count = expanded = updates = deltas = market = 0
     first = source = date = paced = received = previous_kind = None
@@ -283,7 +334,10 @@ def _scan(entries):
         require(isinstance(quotes, list) and len(quotes) <= len(identities), 'Invalid quote count')
         previous_issue = -1
         for q in quotes:
-            require(isinstance(q, dict) and set(q) == QUOTE_KEYS, 'Unknown or missing quote fields')
+            if changed is None:
+                changed = isinstance(q, dict) and BOOK_CHANGES in q and broker(source)
+            require(isinstance(q, dict) and set(q) == (QUOTE_KEYS | {BOOK_CHANGES} if changed else QUOTE_KEYS),
+                    'Unknown or missing quote fields')
             issue = integer(q['issue_id'], 2**32-1)
             require(issue > previous_issue and identities.get(issue) == code(q['code']), 'Quote identity mismatch/duplicate')
             previous_issue = issue
@@ -294,8 +348,16 @@ def _scan(entries):
             for key, value in q.items():
                 if key in BOOK_KEYS:
                     book(value, descending=key.startswith('bid'))
+                elif key == BOOK_CHANGES:
+                    _changes(value)
                 elif key != 'code':
                     integer(value)
+            if changed:
+                # Replayed, the books' best levels are the quote's own: the changes hold what the lists show and more.
+                state = books.setdefault(issue, [{} for _ in BOOKS])
+                apply_changes(state, q[BOOK_CHANGES])
+                require(all(len(side) <= MAX_BOOK_LEVELS for side in state), 'Invalid book changes')
+                require(all(best(state, k) == q[name] for k, name in enumerate(BOOKS)), 'Book changes do not give the quote\'s book')
             # The trades so far account for every change in an issue's volume and turnover.
             volume, turnover = executed.get(issue, (0, 0))
             offset = (q['volume'] - volume, q['turnover10'] - turnover)

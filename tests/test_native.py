@@ -10,6 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import briskapi.cli as cli
 import briskapi.schema as schema
 from briskapi import _native, _parquet
 
@@ -132,14 +133,12 @@ def mutate(rng, table):
     return table.set_column(c, table.schema.field(c), mutated), f'{name}[{row}]'
 
 
-@pytest.mark.parametrize('seed', range(8))
-def test_a_cell_changed_anywhere_is_refused_by_both_or_neither(tmp_path, broker, seed):  # noqa: F811
-    """Mutate one cell of one table, over and over: the Rust verifier and Python's rules must agree on every one (the
-    summary, or the same refusal)."""
-    m, _ = broker
+def mutations(tmp_path, m, seed, trials=40):
+    """Mutate one cell of one table of the package in `tmp_path`, over and over: the verdicts of the Rust verifier and Python's
+    rules on each (the summary, or the same refusal). Returns where they differ, and how many were refused."""
     rng = random.Random(seed)
     disagreements, refused = [], 0
-    for trial in range(40):
+    for trial in range(trials):
         target = tmp_path / f'case{trial}'
         shutil.copytree(tmp_path / 'package', target)
         name = rng.choice(_parquet.FILES)
@@ -151,6 +150,15 @@ def test_a_cell_changed_anywhere_is_refused_by_both_or_neither(tmp_path, broker,
         if python != rust:
             disagreements.append((name, what, python, rust))
         shutil.rmtree(target)
+    return disagreements, refused
+
+
+@pytest.mark.parametrize('seed', range(8))
+def test_a_cell_changed_anywhere_is_refused_by_both_or_neither(tmp_path, broker, seed):  # noqa: F811
+    """Mutate one cell of one table, over and over: the Rust verifier and Python's rules must agree on every one (the
+    summary, or the same refusal)."""
+    m, _ = broker
+    disagreements, refused = mutations(tmp_path, m, seed)
     assert not disagreements, disagreements
     assert refused > 10   # the mutations are not all harmless
 
@@ -182,6 +190,183 @@ def test_the_expected_schemas_are_python_s(tmp_path):
         assert set(found.metadata.metadata) == {b'ARROW:schema', *expected.metadata}
 
 
+def test_the_expected_schemas_with_book_changes_are_python_s(tmp_path):
+    """And the depths table of quotes with book changes has their two columns more, nothing else different."""
+    _native.run(['schemas', tmp_path, '--depths', 'changes'])
+    expected = {**_parquet.SCHEMAS, _parquet.DEPTHS: _parquet.DEPTH_CHANGES_SCHEMA}
+    for name, wanted in expected.items():
+        found = pq.ParquetFile(tmp_path / name)
+        assert found.metadata.schema.to_arrow_schema().equals(wanted, check_metadata=True), name
+        assert set(found.metadata.metadata) == {b'ARROW:schema', *wanted.metadata}
+    assert _parquet.DEPTH_CHANGES_SCHEMA.names == [*_parquet.DEPTH_SCHEMA.names, 'changes', 'checkpoint']
+    with pytest.raises(RuntimeError, match='usage'):
+        _native.run(['schemas', tmp_path, '--depths', 'other'])
+
+
+# Book changes: a broker's quotes that say what of their books changed, and the checkpoints the depths table holds
+
+from test_broker_verify import three_verdicts  # noqa: E402
+from test_spool import lines as event_lines  # noqa: E402
+
+
+@pytest.fixture
+def changed(tmp_path, checkpoints):
+    """A broker's recording with book changes, packaged (a checkpoint every few changes), and its tables in memory."""
+    (tmp_path / 'events.jsonl').write_bytes(b''.join(event_lines(session(changes=True))))
+    m = cli.package(tmp_path / 'events.jsonl', tmp_path / 'package')
+    return m, _parquet.Columns.load(tmp_path / 'package')
+
+
+def test_a_recording_with_book_changes_is_verified_as_python_does(tmp_path, changed):
+    m, columns = changed
+    package = tmp_path / 'package'
+    depths = pq.read_table(package / _parquet.DEPTHS)
+    assert depths.schema.equals(_parquet.DEPTH_CHANGES_SCHEMA, check_metadata=True)
+    assert 0 < depths.column('checkpoint').null_count < len(depths), 'some rows are checkpoints, most are not'
+    assert reference_verifier.verify_broker(package, m) == _parquet.verify_broker(package, m) == m['summary']
+    assert json.loads(_native.run(['verify', package])) == m['summary']
+    # The full checks agree, and so does the summary the columns give: the size of the changes is counted as Python does.
+    assert schema.validate_batches(columns.iter_batches()) == m['summary'] == columns.summary()
+
+
+@pytest.mark.parametrize('rows', [2, 3])
+def test_row_groups_carry_each_issues_books_on_to_the_next(tmp_path, changed, monkeypatch, rows):
+    m, columns = changed
+    monkeypatch.setattr(_parquet, 'ROW_GROUP', rows)
+    target = spoiled(tmp_path, columns, 'groups')
+    assert pq.read_metadata(target / _parquet.DEPTHS).num_row_groups > 20
+    assert reference_verifier.verify_broker(target) == _parquet.verify_broker(target) == m['summary']
+    for threads in (1, 2, 3):   # groups are checked in waves of four to a thread: an issue's rows run on across waves
+        assert json.loads(_native.run(['verify', target, '--row-group', rows, '--threads', threads])) == m['summary']
+
+
+def test_the_default_checkpoint_interval_is_the_same_in_python_and_brisk_parquet(tmp_path):
+    # No checkpoints fixture: a thousand changes of an issue make one.
+    (tmp_path / 'events.jsonl').write_bytes(b''.join(event_lines(session(frames=600, changes=True))))
+    m = cli.package(tmp_path / 'events.jsonl', tmp_path / 'package')
+    points = pq.read_table(tmp_path / 'package' / _parquet.DEPTHS).column('checkpoint')
+    assert 0 < len(points) - points.null_count < 10
+    assert _parquet.verify_broker(tmp_path / 'package', m) == m['summary']
+
+
+def first_change(columns, row=0):
+    return int(columns.changes[0][row])
+
+
+def spoil_a_quantity(c):
+    c.changes[1][first_change(c, 5), 2] += 1   # a later quote's change shows a level of its list with another quantity
+
+
+def spoil_an_emptying(c):
+    c.changes[1][first_change(c), 2:] = 0      # the first quote empties a level the empty book does not have
+
+
+def spoil_the_order(c):
+    at = first_change(c)
+    c.changes[1][[at, at + 1]] = c.changes[1][[at + 1, at]]
+
+
+def spoil_a_shares_without_orders(c):
+    c.changes[1][first_change(c), 3] = 0
+
+
+def spoil_a_zero_price(c):
+    c.changes[1][first_change(c), 1] = 0
+
+
+@pytest.mark.parametrize('spoil, message', [
+    (spoil_a_quantity, 'Book changes do not give the quote\'s book'),
+    (spoil_an_emptying, 'Book change empties a level the book does not have'),
+    (spoil_the_order, 'Book changes out of order'),
+    (spoil_a_shares_without_orders, 'Invalid book change'),
+    (spoil_a_zero_price, 'Invalid book change'),
+])
+def test_book_changes_that_break_a_rule_are_refused_with_the_same_words_by_all_three(tmp_path, changed, spoil, message):
+    """Python's full rules (schema), brisk-parquet and the reference verifier, on changes written with the checkpoints the
+    unspoiled ones had (as the rest of the recording stays, so only the changes are wrong)."""
+    _, columns = changed
+    points = columns.checkpoints(np.arange(len(columns)))
+    spoil(columns)
+    columns.checkpoints = lambda order: points
+    assert three_verdicts(tmp_path, columns, 'spoiled') == (message,) * 3
+
+
+def spoiled_table(tmp_path, m, change):
+    """The verdicts of the reference verifier and brisk-parquet on the package with its depths table changed by `change`
+    (a function of the table, which gives the new one)."""
+    target = tmp_path / 'spoiled-table'
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(tmp_path / 'package', target)
+    rewrite(target, _parquet.DEPTHS, change(pq.read_table(target / _parquet.DEPTHS)))
+    return outcome(reference_verifier.verify_broker, target, m), outcome(_parquet.verify_broker, target, m)
+
+
+def with_cells(table, name, change):
+    """The table with the cells of column `name` (a list of lists of dicts) changed by `change(cells)`."""
+    cells = table.column(name).to_pylist()
+    change(cells)
+    at = table.schema.get_field_index(name)
+    return table.set_column(at, table.schema.field(at), pa.array(cells, table.schema.field(at).type))
+
+
+def a_checkpoint(cells, present=True):
+    return next(i for i, cell in enumerate(cells) if i and (cell is not None) == present)
+
+
+@pytest.mark.parametrize('how', ['dropped', 'added', 'size', 'short', 'swapped', 'emptied', 'longer'])
+def test_a_checkpoint_where_it_should_not_be_or_not_what_it_should_be_is_refused(tmp_path, changed, how):
+    m, _ = changed
+
+    def change(cells):
+        i = a_checkpoint(cells)
+        if how == 'dropped':
+            cells[i] = None
+        elif how == 'added':
+            cells[a_checkpoint(cells, present=False)] = cells[i]
+        elif how == 'size':
+            cells[i][0]['size'] += 1
+        elif how == 'short':
+            cells[i].pop()
+        elif how == 'swapped':
+            cells[i][0], cells[i][1] = cells[i][1], cells[i][0]
+        elif how == 'emptied':
+            cells[i] = []
+        else:
+            cells[i].append(cells[i][-1])
+    verdicts = spoiled_table(tmp_path, m, lambda table: with_cells(table, 'checkpoint', change))
+    assert verdicts == (f'Non-canonical {_parquet.DEPTHS}',) * 2
+
+
+def test_a_book_that_is_not_one_of_the_four_is_refused(tmp_path, changed):
+    m, _ = changed
+
+    def change(cells):
+        cells[3][0]['book'] = 9
+    verdicts = spoiled_table(tmp_path, m, lambda table: with_cells(table, 'changes', change))
+    assert verdicts == ('Invalid book change',) * 2
+
+
+def test_a_depths_table_with_one_of_its_two_columns_more_is_not_the_schema(tmp_path, changed):
+    m, _ = changed
+    for drop in ('changes', 'checkpoint'):
+        verdicts = spoiled_table(tmp_path, m, lambda table: table.drop_columns([drop]))
+        assert verdicts == ('Unexpected schema in data/order_book_depths.parquet',) * 2
+
+
+def test_the_formats_before_book_changes_do_not_take_them(tmp_path, changed):
+    m, _ = changed
+    with pytest.raises(ValueError, match='Unexpected schema'):
+        _parquet.verify_broker(tmp_path / 'package', dict(m, schema=schema.LEGACY_SCHEMA))
+
+
+@pytest.mark.parametrize('seed', range(8))
+def test_a_cell_changed_anywhere_in_a_recording_with_book_changes_is_refused_by_both_or_neither(tmp_path, changed, seed):
+    m, _ = changed
+    disagreements, refused = mutations(tmp_path, m, seed)
+    assert not disagreements, disagreements
+    assert refused > 10
+
+
 # Packaging: parts of a spooled segment, as one recording
 
 from test_spool import many_parts, same_tables, session, spooled  # noqa: E402  (the segment's fixtures)
@@ -211,12 +396,20 @@ def two_ways(tmp_path, spool, parts, k=None, end=None, range_rows=None):
     after = pq.read_table(tmp_path / 'state2.parquet')
     assert after.column('issue_id').to_pylist() == latest.q['issue_id'].tolist()
     assert after.column('sequence').to_pylist() == latest.q['frame'].tolist()
+    # With book changes, a piece starts from each issue's whole books (all their levels, as from empty), and no checkpoint.
+    assert ('changes' in after.column_names) == (latest.changes is not None)
+    if latest.changes is not None:
+        assert after.column('changes').to_pylist() == _parquet._change_list(*latest.changes).to_pylist()
+        assert after.column('checkpoint').null_count == len(after)
     return result
 
 
-@pytest.fixture
-def segment(tmp_path):
-    spool = spooled(tmp_path, session())
+@pytest.fixture(params=[False, True], ids=['plain', 'book changes'])
+def segment(request, tmp_path):
+    """A spooled segment of a session, with book changes (a checkpoint after every few) or without."""
+    if request.param:
+        request.getfixturevalue('checkpoints')
+    spool = spooled(tmp_path, session(changes=request.param))
     spool.close_part(wait=True)
     assert len(spool.parts()) > 5
     return spool
@@ -268,6 +461,16 @@ def test_a_segment_of_hundreds_of_parts_is_packaged_as_python_does(tmp_path):
     midnight = _parquet.midnight_ns(_parquet.bootstrap_row(parts[0])['trading_date'])
     clock = _native.state(spool.path, parts[:450], midnight, tmp_path / 'state450.parquet', day_start=parts[0])
     assert clock == _parquet.part_index(parts[449], midnight)['last']
+
+
+def test_a_segment_of_parts_with_and_without_quotes_is_packaged_as_python_does_with_book_changes(tmp_path, checkpoints):
+    # A part of a history batch, or of the end alone, has no quotes: its depths table does not say whether they have book changes.
+    spool, _ = many_parts(tmp_path, 500, changes=True)
+    parts = spool.parts()
+    assert any(pq.read_metadata(part / _parquet.DEPTHS).num_rows == 0 for part in parts)
+    result = two_ways(tmp_path, spool, parts)
+    assert result['summary']['batches'] == 500
+    assert json.loads(_native.run(['verify', tmp_path / 'rust'])) == result['summary']
 
 
 def test_a_whole_segment_is_packaged_as_python_does(tmp_path, segment):
@@ -335,8 +538,11 @@ def test_a_piece_that_stops_early_gets_an_end(tmp_path, segment):
     assert json.loads(_native.run(['verify', tmp_path / 'rust'])) == result['summary'] and not result['repaired']
 
 
-def test_a_segment_cut_short_is_repaired(tmp_path):
-    spool = spooled(tmp_path, session()[:30])
+@pytest.mark.parametrize('changes', [False, True], ids=['plain', 'book changes'])
+def test_a_segment_cut_short_is_repaired(tmp_path, changes, request):
+    if changes:
+        request.getfixturevalue('checkpoints')
+    spool = spooled(tmp_path, session(changes=changes)[:30])
     spool.close_part(wait=True)
     result = two_ways(tmp_path, spool, spool.parts(), end='repair')
     assert result['repaired'] and json.loads(_native.run(['verify', tmp_path / 'rust'])) == result['summary']
@@ -368,18 +574,58 @@ def part_header(first_line):
     return header | {'master': [], 'quotes': [], 'trades': []}
 
 
-def test_a_part_is_the_same_tables_python_writes(tmp_path):
+@pytest.mark.parametrize('changes', [False, True], ids=['plain', 'book changes'])
+def test_a_part_is_the_same_tables_python_writes(tmp_path, changes):
     from test_spool import lines as as_lines
-    batches = session()
+    batches = session(changes=changes)
     every = as_lines(batches)
     header = part_header(every[0])
     midnight = _parquet.midnight_ns(header['trading_date'])
-    for name, chunk in (('whole', every), ('later', every[5:20]), ('end', every[-4:]), ('one', every[:1])):
+    # (A part of a history batch alone has no quotes to say whether they have book changes: its depths table is the plain one.)
+    for name, chunk in (('whole', every), ('later', every[5:20]), ('end', every[-4:]), ('one', every[:1]), ('history', every[1:2])):
         target = tmp_path / name
         python = python_part(tmp_path / name, chunk, header)
         counts = _native.part(chunk, target / 'rust', midnight)
         same_tables(target / 'rust', python, (_parquet.BATCHES, _parquet.DEPTHS, _parquet.TRADES))
         assert counts['batches'] == len(chunk)
+        names = pq.read_schema(target / 'rust' / _parquet.DEPTHS).names
+        assert ('changes' in names) == (changes and name != 'history') == ('checkpoint' in names)
+        if 'changes' in names:
+            assert pq.read_table(target / 'rust' / _parquet.DEPTHS).column('checkpoint').null_count == counts['quotes']
+
+
+def test_quotes_with_and_without_book_changes_are_refused(tmp_path):
+    from test_spool import lines as as_lines
+    batches = session(changes=True)
+    for q in batches[5]['quotes']:
+        del q[schema.BOOK_CHANGES]
+    every = as_lines(batches)
+    midnight = _parquet.midnight_ns('20260311')
+    with pytest.raises(ValueError, match='Quotes with and without book changes'):   # in lines read on other threads
+        _native.part(every, tmp_path / 'many', midnight, threads=64)
+    with pytest.raises(ValueError, match='Unknown or missing quote fields'):   # in the lines of one thread
+        _native.part(every, tmp_path / 'one', midnight, threads=1)
+    with pytest.raises(ValueError, match='Unknown or missing quote fields'):
+        _parquet.Columns.from_batches(batches)
+    for message, change in (('Invalid book change', lambda c: c.append([1, 2, 3])), ('Invalid book change', lambda c: c.__setitem__(0, [9, 1, 1, 1])),
+                            ('Invalid negative value', lambda c: c.__setitem__(0, [0, -1, 1, 1]))):
+        bad = session(changes=True)
+        change(bad[3]['quotes'][0][schema.BOOK_CHANGES])
+        with pytest.raises(ValueError, match=message):
+            _native.part(as_lines(bad), tmp_path / 'bad', midnight)
+
+
+def test_parts_with_and_without_book_changes_are_not_packaged_together(tmp_path):
+    spool, batches = many_parts(tmp_path, 12, changes=True)
+    midnight = _parquet.midnight_ns(batches[0]['trading_date'])
+    plain = session(frames=9)
+    from test_spool import lines as as_lines
+    _native.part(as_lines(plain)[6:7], spool.path / 'parts' / '000007', midnight)   # a part of batch 6, without
+    assert pq.read_schema(spool.path / 'parts' / '000007' / _parquet.DEPTHS).names == _parquet.DEPTH_SCHEMA.names
+    with pytest.raises(ValueError, match='Quotes with and without book changes'):
+        _native.package(spool.path, spool.parts(), tmp_path / 'out', midnight)
+    with pytest.raises(ValueError, match='Quotes with and without book changes'):
+        _native.state(spool.path, spool.parts(), midnight, tmp_path / 'state.parquet', day_start=spool.parts()[0])
 
 
 def test_a_line_that_is_not_a_batch_is_refused(tmp_path):

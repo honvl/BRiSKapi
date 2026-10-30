@@ -28,10 +28,12 @@ pub struct Context<'a> {
     trade_fixed: u64,
     /// The tables are in v2's format (`ts_init`).
     legacy: bool,
+    /// The quotes have book changes (the depths table has `changes` and `checkpoint` columns).
+    pub changes: bool,
 }
 
 impl<'a> Context<'a> {
-    pub fn new(batches: &'a Batches, master: &'a [Master], legacy: bool) -> Self {
+    pub fn new(batches: &'a Batches, master: &'a [Master], legacy: bool, changes: bool) -> Self {
         Context {
             batches,
             master,
@@ -42,6 +44,7 @@ impl<'a> Context<'a> {
             quote_fixed: schema::object_length(&schema::QUOTE_KEYS),
             trade_fixed: schema::object_length(&TRADE_KEYS),
             legacy,
+            changes,
         }
     }
 
@@ -159,6 +162,36 @@ fn u64s<'a>(batch: &'a RecordBatch, name: &str) -> Res<&'a [u64]> {
     Ok(prim::<UInt64Type>(batch, name)?.values())
 }
 
+/// The quotes' book changes, decoded: whole prices and sizes, and books that are books; adds their canonical JSON bytes. The
+/// rules they obey (order, emptied levels, the books they give) are `replay`'s.
+fn changes(batch: &RecordBatch, bytes: &mut u64) -> Res<()> {
+    let list = batch
+        .column_by_name(schema::CHANGES)
+        .and_then(|c| c.as_list_opt::<i32>())
+        .ok_or_else(|| bad_schema(schema::CHANGES))?;
+    let levels = list.values().as_struct();
+    let (Some(book), Some(price), Some(size)) = (
+        levels.column(0).as_primitive_opt::<UInt8Type>(),
+        levels.column(1).as_primitive_opt::<Decimal128Type>(),
+        levels.column(2).as_primitive_opt::<Decimal128Type>(),
+    ) else {
+        return Err(bad_schema(schema::CHANGES));
+    };
+    let offsets = list.value_offsets();
+    let used = offsets[0] as usize..offsets[offsets.len() - 1] as usize;
+    require!(
+        used.clone()
+            .all(|j| tenths(price.value(j)).is_some() && whole(size.value(j)).is_some()),
+        "Invalid decimal value"
+    );
+    require!(
+        used.clone().all(|j| (book.value(j) as usize) < BOOKS.len()),
+        "Invalid book change"
+    );
+    *bytes += crate::sizes::changes_bytes(list);
+    Ok(())
+}
+
 /// A quote row group: the canonical encoding of its content and the rules that hold row by row, checked in the order
 /// `verify_broker` does (what cannot be decoded, what is not canonical, then the rules), so a recording is refused for the
 /// same reason by both. `counts` is told how many quotes each batch holds.
@@ -247,6 +280,9 @@ pub fn check_depths(batch: &RecordBatch, context: &Context, counts: &mut [u32]) 
     let mut deferred = Vec::with_capacity(4);
     for (list, (_, descending)) in books.iter().zip(BOOKS) {
         deferred.push(side(list, descending, &mut bytes)?);
+    }
+    if context.changes {
+        changes(batch, &mut bytes)?;
     }
     // Canonical: the table is what the decoded content encodes to.
     let flags = prim::<UInt8Type>(batch, "flags")?.values();

@@ -142,6 +142,58 @@ group at a time, `Market.trades()` reads the trades table alone, and the Nautilu
 instrument at a time. Only batch order (`batches()`, `lines()`, `--jsonl`) needs the recording in
 memory, tens of gigabytes for a session, as its rows are stored by security.
 
+### Book changes (full depth)
+
+A broker quote's lists hold its books' ten best levels, which is what `mbp-10` and NautilusTrader's
+`OrderBookDepth` need. The whole books go along as `book_changes`, Databento's MBO model at the grain
+BRiSK gives (price levels with their shares and order counts; BRiSK has no order IDs): the levels of
+the four books (bid, ask, and the closing-condition orders' two) that differ from the security's
+previous quote, `[book, price10, quantity, orders]` each book's best first, 0 shares and orders for
+a level that emptied; a security's first quote of a session holds them whole. The decoder
+(`bookChanges`: the host's own and the recording's quote workers, which each read a fixed share of
+the issues and so diff their own reads; not the fast lane's, whose reads go to Live) reads every
+nonempty level of every quote's books, from the ladder in bounded reads even past a crossed
+auction's middle, and remembers each issue's books for the next. On the whole demo replay every one
+of its 735,382 quotes' changes replays to books whose best ten are its lists and whose levels sum
+to the board's totals (`tools/brisk_mock/decoder.test.cjs` checks the opening's first 30 seconds).
+
+Why changes and not whole books on every row, measured on that replay: whole books are 13 times the
+levels after the open (20 to 258 a quote), 3.6 times the canonical JSON and 2.6 times the decode
+time, several times the archive's 4 GiB package for a broker's day; keeping them only in auctions
+(an approach tried and dropped) still loses the book beyond ten in continuous trading, where ten
+levels hold a median 16% of a side's shares and reach 0.9% from the mid, and one security in six
+traded past them within three minutes of the open. Changes are 2.7 levels an update (half change
+one level, 87% four or fewer), some 18 bytes an update packaged with checkpoints, against some 23
+for a whole recording already. Reading them costs a replay, which checkpoints bound. Writing them costs
+the decoder its whole books on every quote. Read level by level in JavaScript that halved the host's speed at the
+opening; read and compared by the board kernel (`compact()`, `diff()`: see BoardReader below) it costs nothing the
+feed notices: `tools/brisk_mock/benchmark_feed.py` (the demo's opening, 3,000 frames, unpaced, through host, workers
+and feed) gives 137,000-145,000 updates a second with 4 quote workers (143,000-145,000 without book changes, 74,000-
+76,000 with them read in JavaScript) and 163,000-168,000 with 8 (157,000-163,000; 108,000-118,000), the host's
+memory 2.2 GB for 1.7 and 3.2 GB for 2.9 (each decoder keeps its issues' last ladders). One thread reads 64,000-71,000
+quotes a second with book changes, 90,000 without.
+
+In the tables (`briskapi/_parquet.py`, `rust/brisk_parquet`) a recording whose quotes have book
+changes keeps format v3 and its depths table gains two columns (`DEPTH_CHANGES_SCHEMA`): `changes`,
+the quote's own, and `checkpoint`, null but for every `CHECKPOINT_CHANGES` (1,000) changes of an
+issue since its last (its first row holds its books whole), where it is the issue's whole books.
+The demo's tables, and broker recordings from before 1.9.0, are unchanged byte for byte, so the
+archive's demo references stand. Validation replays each issue's changes and requires its books'
+best ten to be the quote's lists; checkpoints must be where the rule puts them and what the replay
+gives. A piece after a cut starts from the cut state's whole books, as its first quotes' changes.
+
+`book-deltas` (`briskapi/records.py`) turns rows into records: `R` and `A` for a first quote or a
+snapshot (flags 32), then `A` (a level the replayed book lacked), `M` or `C` per change, an update's
+last flagged 128. The cloud API (`query_engine._deltas`) finds each security's last checkpoint before
+`start` from row-group statistics and the checkpoint column, seeds `records.Books` from it and
+replays at most that many changes; `snapshot` puts the books as of `start` first (`book_snapshot`).
+Overlapping recordings of a day are not merged: each one's changes are from its own previous
+update, so the longest is read (`_one_capture`). Live needs a `start` (its subscription replays the
+day from the spool to know the books) and stays on the recording's lane; the same functions make its
+records. `brisk repair` replays both recordings' changes into whole books, merges the rows and
+writes each security's changes again from row to row. The Nautilus export writes `OrderBookDelta`
+for the bid and ask books.
+
 ## Live feed
 
 `briskapi.Feed` reads decoder output on a background thread and applies each batch
@@ -628,8 +680,14 @@ notional columns (quantity × price) on the way. A call costs the same for 1 row
   assembled into `decoder.cjs`), which shares the decoder's memory: `create()` makes the memory the
   glue would (its import's size) and hands it over. Each side's ten levels are read from the best
   end of the ladder, and their prices from `_getTickPrice10ToIndex` (the lowest price at that
-  index, remembered per tick type). A quantity `_getItaRows` could not convert is a trap here
-  too.
+  index, remembered per tick type in an array by index). A quantity `_getItaRows` could not convert
+  is a trap here too. With book changes the kernel reads the ladder whole instead: `compact()`
+  writes, in the same pass as the totals, every level that holds anything (tick index, the four
+  quantities, the four order counts) as arrays, and `diff()` compares them with the issue's last
+  ladder, kept in the decoder's memory, four quantities and counts at once, and writes only the
+  levels that differ. A decoder reading through `_getItaRows` builds the same ladder from its walk
+  and compares in JavaScript, with exactly the same result (the periodic check compares both
+  ladders, every level).
 - **Checks.** At start every issue's book must equal `_getItaRows`'; every 4,096th book after
   that is checked again; anything amiss, or a build whose code does not read as expected, and
   the decoder reads books through `_getItaRows` for the rest of its life (the host's

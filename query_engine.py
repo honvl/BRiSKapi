@@ -197,19 +197,22 @@ class Request(NamedTuple):
     start: int
     end: int
     limit: int | None
+    snapshot: bool = False   # book-deltas: each security's books as of the start, first
 
 
-def request(dataset, schema='trades', symbols=None, start=None, end=None, limit=None, stype_in='raw_symbol', **_) -> Request:
+def request(dataset, schema='trades', symbols=None, start=None, end=None, limit=None, stype_in='raw_symbol', snapshot=False,
+            **_) -> Request:
     require(dataset in DATASETS, f'Unknown dataset {dataset!r}; one of {", ".join(DATASETS)}')
     require(schema in SCHEMAS, f'Unknown schema {schema!r}; one of {", ".join(SCHEMAS)}')
     require(stype_in in (None, '', 'raw_symbol'), 'Only stype_in=raw_symbol (JPX codes) is supported')
+    require(type(snapshot) is bool and (not snapshot or schema == 'book-deltas'), 'snapshot is true or false, for book-deltas')
     begin = timestamp(start)
     finish = timestamp(end, default=(begin + JST_NS) // DAY_NS * DAY_NS - JST_NS + DAY_NS)
     require(EARLIEST <= begin < finish <= LATEST, 'end must be after start, both between 2000 and 2100')
     trading_dates(begin, finish)
     count = None if limit in (None, '', 0, '0') else int(limit)
     require(count is None or count > 0, 'limit must be positive')
-    return Request(dataset, schema, symbols_of(symbols), begin, finish, count)
+    return Request(dataset, schema, symbols_of(symbols), begin, finish, count, snapshot)
 
 
 # Reading a recording's tables
@@ -273,9 +276,90 @@ def _receipts(bucket, rec, seq, ts_event):
     return pa.array(np.where(values > 0, values, pc.cast(ts_event, pa.int64()).to_numpy()), TIME)
 
 
+_DELTA_COLUMNS = ['issue_id', 'seq', 'sequence', 'ts_event', 'identifier', 'changes', 'checkpoint']
+
+
+def _deltas(bucket, rec, ids, req, publisher):
+    """One recording's book-deltas: each issue's rows replayed from its last checkpoint before the start (or from its
+    first quote), never the day before it; those within [start, end) are returned, and with `snapshot` its books as
+    of the start first. A recording without book changes (the demo's, a broker's from before 1.9.0) has none."""
+    source = bucket.parquet(rec.files[DEPTHS])
+    meta = source.metadata
+    if 'changes' not in source.schema_arrow.names or not ids or not meta.num_row_groups:
+        return records.empty('book-deltas')
+    leaves = {name: _leaf(meta, name) for name in ('issue_id', 'ts_event')}
+    low, high = min(ids), max(ids)
+    wanted = pa.array(sorted(ids), pa.uint64())
+    groups = []   # the row groups holding the issues before the end, in order (rows run by issue, then batch)
+    for g in range(meta.num_row_groups):
+        issue, ts = (meta.row_group(g).column(leaves[k]).statistics for k in ('issue_id', 'ts_event'))
+        if issue.has_min_max and (issue.max < low or issue.min > high):
+            continue
+        if ts.has_min_max and _ns(ts.min) >= req.end:
+            continue
+        groups.append((g, ts.has_min_max and _ns(ts.max) < req.start))
+    # Each issue's anchor: its last checkpoint before the start, else its first row (both as (group, row)).
+    anchors, first = {}, {}
+    for g, _ in groups:
+        light = source.read_row_group(g, columns=['issue_id', 'ts_event', 'checkpoint'])
+        issues = light.column('issue_id').to_numpy()
+        ts = pc.cast(light.column('ts_event'), pa.int64()).to_numpy()
+        points = light.column('checkpoint').is_valid().to_numpy(zero_copy_only=False)
+        for row in np.flatnonzero(pc.is_in(light.column('issue_id'), value_set=wanted).to_numpy(zero_copy_only=False)):
+            issue = int(issues[row])
+            first.setdefault(issue, (g, int(row)))
+            if points[row] and ts[row] < req.start:
+                anchors[issue] = (g, int(row))
+    books, tables, flags, seeds = records.Books(), [], [], []
+    for g, before in groups:
+        if before and not any(anchors.get(i, first.get(i, (g + 1,)))[0] <= g for i in ids):
+            continue   # wholly before every anchor
+        table = source.read_row_group(g, columns=_DELTA_COLUMNS)
+        issues, ts = table.column('issue_id').to_pylist(), pc.cast(table.column('ts_event'), pa.int64()).to_pylist()
+        keep, is_first = [], []
+        for row, issue in enumerate(issues):
+            if issue not in ids or ts[row] >= req.end:
+                continue
+            at = anchors.get(issue)
+            if (g, row) == at:   # the checkpoint: the books after it
+                point = table.column('checkpoint')[row].as_py()
+                books.seed(issue, table.column('identifier')[row].as_py().removesuffix('.XTKS'),
+                           [[c['book'], round(c['price'] * 10), int(c['size']), c['count']] for c in point],
+                           table.column('sequence')[row].as_py(), ts[row], ts[row])
+                seeds.append((issue, table.column('seq')[row].as_py(), ts[row]))
+            elif (g, row) > (at or first[issue]) or (at is None and (g, row) == first[issue]):
+                keep.append(row)
+                is_first.append(at is None and (g, row) == first[issue])
+        if keep:
+            tables.append(table.take(pa.array(keep, pa.int64())))
+            flags += is_first
+    if seeds:   # a checkpoint's update was received when its batch was
+        received = _receipts(bucket, rec, pa.array([s for _, s, _ in seeds], pa.uint64()),
+                             pa.array([e for *_, e in seeds], pa.int64()).cast(TIME))
+        for (issue, _, _), recv in zip(seeds, pc.cast(received, pa.int64()).to_pylist()):
+            frame, event, _ = books.last[issue]
+            books.last[issue] = (frame, event, recv)
+    rows = pa.concat_tables(tables) if tables else source.schema_arrow.empty_table().select(_DELTA_COLUMNS)
+    ts_recv = _receipts(bucket, rec, rows.column('seq').combine_chunks(), rows.column('ts_event').combine_chunks()) \
+        if rows.num_rows else None
+    if not req.snapshot:
+        return records.deltas(rows, publisher, books, ts_recv, start=req.start, first=flags)
+    # The books as of the start, then what changed since.
+    before = pc.less(pc.cast(rows.column('ts_event'), pa.int64()), req.start).to_numpy(zero_copy_only=False) \
+        if rows.num_rows else np.zeros(0, bool)
+    take = lambda mask: pa.array(np.flatnonzero(mask), pa.int64())   # noqa: E731
+    flags = np.array(flags, bool)
+    records.deltas(rows.take(take(before)), publisher, books, ts_recv and ts_recv.take(take(before)), first=list(flags[before]))
+    return pa.concat_tables([records.book_snapshot(books, publisher, ids),
+                             records.deltas(rows.take(take(~before)), publisher, books, ts_recv and ts_recv.take(take(~before)),
+                                            first=list(flags[~before]))])
+
+
 def _project(bucket, rec, req, publisher):
     """One recording's records of the requested (non-bar) schema."""
     ids = _ids(bucket, rec, req.symbols)
+    if req.schema == 'book-deltas':
+        return _deltas(bucket, rec, ids, req, publisher)
     if req.schema == 'definition':
         equity = pq.read_table(io.BytesIO(bucket.read(rec.files[EQUITY])))
         equity = equity.filter(pc.is_in(equity.column('issue_id'), value_set=pa.array(sorted(ids), pa.uint64())))
@@ -456,6 +540,16 @@ def _dedupe(table, keys):
 
 # Queries
 
+def _one_capture(recs):
+    """The recordings book-deltas reads: a day's consecutive pieces, but of captures that overlap in time only the
+    longest (its changes are each from its own previous update, so two captures' do not interleave)."""
+    kept = []
+    for rec in sorted(recs, key=lambda r: r.first - r.last):
+        if not any(rec.date == k.date and rec.first < k.last and k.first < rec.last for k in kept):
+            kept.append(rec)
+    return sorted(kept, key=lambda r: r.first)
+
+
 def get_range(bucket, owner, req: Request) -> pa.Table:
     """The records of a request, merged across recordings, deduplicated, time-ordered, cut to `limit`."""
     publisher = DATASETS[req.dataset][0]
@@ -468,9 +562,11 @@ def get_range(bucket, owner, req: Request) -> pa.Table:
     if req.schema in BARS:
         table = _bars(bucket, owner, req, recs, publisher)
     else:
+        if req.schema == 'book-deltas':
+            recs = _one_capture(recs)
         parts = [_project(bucket, rec, req, publisher) for rec in recs]
         table = pa.concat_tables(parts) if parts else records.empty(req.schema)
-        if len(parts) > 1:
+        if len(parts) > 1 and req.schema != 'book-deltas':
             key = {'trades': ['instrument_id', 'trade_id'], 'definition': ['instrument_id', 'ts_event'],
                    'imbalance': ['instrument_id', 'sequence', 'auction_type']}.get(req.schema, ['instrument_id', 'sequence'])
             # A record several captures hold keeps its EARLIEST receipt: the first moment a program on any of them could

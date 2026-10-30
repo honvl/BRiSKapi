@@ -6,6 +6,9 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use rayon::prelude::*;
 use serde_json::{Value, json};
 
@@ -13,8 +16,9 @@ use crate::batches::{self, END, HISTORY, QUOTES};
 use crate::error::{Failure, Res};
 use crate::files;
 use crate::master;
+use crate::replay::{IssueState, Rows};
 use crate::require;
-use crate::rows::{Context, Group, Trades, check_depths};
+use crate::rows::{Context, Edge, Group, Trades, check_depths};
 use crate::schema::{self, ROW_GROUP};
 
 pub struct Options {
@@ -36,6 +40,73 @@ impl Default for Options {
 }
 
 const MAX_HISTORY: u64 = 50_000;
+
+/// An issue's rows in a wave: (group, first row, end row) of each run of them.
+type Chain = (u64, Vec<(usize, usize, usize)>);
+
+/// A wave's row groups' book changes replayed (`replay`): each issue's rows, across the groups of the wave, are one chain,
+/// and chains are replayed on the pool's threads at once. The wave's first chain goes on from `carry`, the last issue of the
+/// wave before it if it is the same; the last chain's state is carried on.
+fn replay_wave(
+    pool: &rayon::ThreadPool,
+    batches: &[RecordBatch],
+    carry: Option<(u64, IssueState)>,
+) -> Res<Option<(u64, IssueState)>> {
+    let rows: Vec<Rows> = batches.iter().map(Rows::new).collect::<Res<_>>()?;
+    let mut chains: Vec<Chain> = Vec::new();
+    for (g, batch) in batches.iter().enumerate() {
+        let issues = batch
+            .column_by_name("issue_id")
+            .and_then(|c| c.as_primitive_opt::<UInt64Type>())
+            .map(|a| a.values())
+            .ok_or_else(|| Failure::Refused("Unexpected schema in issue_id".into()))?;
+        let mut i = 0;
+        while i < issues.len() {
+            let mut j = i + 1;
+            while j < issues.len() && issues[j] == issues[i] {
+                j += 1;
+            }
+            match chains.last_mut() {
+                Some((issue, runs)) if *issue == issues[i] => runs.push((g, i, j)),
+                _ => chains.push((issues[i], vec![(g, i, j)])),
+            }
+            i = j;
+        }
+    }
+    if chains.is_empty() {
+        return Ok(carry);
+    }
+    let mut starts: Vec<Option<IssueState>> = (0..chains.len()).map(|_| None).collect();
+    if let Some((issue, state)) = carry
+        && issue == chains[0].0
+    {
+        starts[0] = Some(state);
+    }
+    let walked: Vec<Res<IssueState>> = pool.install(|| {
+        chains
+            .par_iter()
+            .zip(starts.par_iter_mut())
+            .map(|((_, runs), start)| {
+                let mut state = start.take().unwrap_or_default();
+                for &(g, from, to) in runs {
+                    for i in from..to {
+                        let point = state.apply(&rows[g], i)?;
+                        require!(
+                            rows[g].checkpoint_is(i, &state.books, point),
+                            format!("Non-canonical {}", schema::DEPTHS)
+                        );
+                    }
+                }
+                Ok(state)
+            })
+            .collect()
+    });
+    let mut last = None;
+    for ((issue, _), state) in chains.iter().zip(walked) {
+        last = Some((*issue, state?));
+    }
+    Ok(last)
+}
 
 pub fn verify_broker(
     directory: &Path,
@@ -63,41 +134,51 @@ pub fn verify_broker(
     master::check_canonical(&equity_rows, &master, batches.midnight)?;
     progress("verify: batches");
     let n = batches.kinds.len();
-    let context = Context::new(&batches, &master, legacy);
+    let context = Context::new(&batches, &master, legacy, depths.changes);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads.max(1))
         .build()
         .map_err(|e| Failure::Fault(e.into()))?;
 
-    // Quotes: row groups in parallel, each counting its quotes per batch into its thread's own array.
+    // Quotes: row groups in parallel, a wave of them at a time, each counting its quotes per batch into its thread's own
+    // array. The quotes' book changes are replayed, issue by issue, as each wave is done (see `replay_wave`).
     let tallies: Vec<Mutex<Vec<u32>>> = (0..pool.current_num_threads())
         .map(|_| Mutex::new(vec![0u32; n]))
         .collect();
-    let groups: Vec<Group> = pool.install(|| {
-        (0..depths.groups)
-            .into_par_iter()
-            .map(|g| {
-                let batch = depths.read(directory, g)?;
-                let index = rayon::current_thread_index().unwrap_or(0);
-                let mut counts = tallies[index].lock().unwrap_or_else(|e| e.into_inner());
-                check_depths(&batch, &context, &mut counts)
-            })
-            .collect::<Res<Vec<Group>>>()
-    })?;
-    let mut previous: Option<&Group> = None;
-    for group in &groups {
-        if let Some(before) = previous {
-            let (a, b) = (before.last, group.first);
-            require!(
-                (a.issue, a.seq) < (b.issue, b.seq),
-                "Quotes not sorted by issue, then batch"
-            );
-            require!(
-                a.issue != b.issue || (b.frame >= a.frame && b.time >= a.time),
-                "Quote frame/time regression"
-            );
+    let (wave, mut groups) = (pool.current_num_threads() * 4, Vec::<Group>::new());
+    let (mut carry, mut previous) = (None, None::<Edge>);
+    for from in (0..depths.groups).step_by(wave) {
+        let done: Vec<(Group, Option<RecordBatch>)> = pool.install(|| {
+            (from..(from + wave).min(depths.groups))
+                .into_par_iter()
+                .map(|g| {
+                    let batch = depths.read(directory, g)?;
+                    let index = rayon::current_thread_index().unwrap_or(0);
+                    let mut counts = tallies[index].lock().unwrap_or_else(|e| e.into_inner());
+                    let group = check_depths(&batch, &context, &mut counts)?;
+                    Ok((group, depths.changes.then_some(batch)))
+                })
+                .collect::<Res<Vec<_>>>()
+        })?;
+        for (group, _) in &done {
+            if let Some(a) = previous {
+                let b = group.first;
+                require!(
+                    (a.issue, a.seq) < (b.issue, b.seq),
+                    "Quotes not sorted by issue, then batch"
+                );
+                require!(
+                    a.issue != b.issue || (b.frame >= a.frame && b.time >= a.time),
+                    "Quote frame/time regression"
+                );
+            }
+            previous = Some(group.last);
         }
-        previous = Some(group);
+        if depths.changes {
+            let batches: Vec<RecordBatch> = done.iter().filter_map(|(_, b)| b.clone()).collect();
+            carry = replay_wave(&pool, &batches, carry)?;
+        }
+        groups.extend(done.into_iter().map(|(group, _)| group));
     }
     let quote_rows: usize = groups.iter().map(|g| g.rows).sum();
     require!(

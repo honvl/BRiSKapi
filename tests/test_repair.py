@@ -10,7 +10,7 @@ import briskapi.cli as cli
 import briskapi.schema as schema
 from briskapi import _parquet, _repair
 
-from test_spool import lines
+from test_spool import with_book_changes, lines
 
 OPEN_US = 9 * 3600 * 10**6
 TICK = 100_000
@@ -173,6 +173,26 @@ def test_frames_a_feed_lost_are_added_from_the_other_with_its_receipt_time(tmp_p
     assert report['package']['summary'] == _parquet.verify_broker(tmp_path / 'repaired')
     assert report['package']['summary']['quote_updates'] == expected[2].batches[-1]['quote_updates'] + len(ISSUES)   # and the opening book
     assert json.loads((tmp_path / 'repaired' / 'manifest.json').read_text()) == report['package']
+
+
+def test_a_repair_of_recordings_with_book_changes_writes_each_securitys_changes_again(tmp_path, group, checkpoints):
+    # Each recording's book changes are from its own previous update: a lost update added from the other feed, and the next of
+    # its security, get theirs again from the books, and the checkpoints are where the rule puts them (verify replays both).
+    gone = {20, 21, 22, 40, 41}
+    a, b, whole = (package(tmp_path, name, 0, 80, spoil=with_book_changes, **options)
+                   for name, options in (('a', {'drop': gone}), ('b', {'received': 7}), ('whole', {})))
+    report = repair(a, b, tmp_path / 'repaired')
+    assert report['repair']['quotes'] == 6
+    assert report['package']['summary'] == _parquet.verify_broker(tmp_path / 'repaired')
+    got, expected = rows(tmp_path / 'repaired'), rows(whole)
+    assert got[0] == expected[0] and got[1] == expected[1]
+    books = lambda d: [q for batch in _parquet.Columns.load(d).iter_batches() for q in batch.get('quotes', ())]   # noqa: E731
+    repaired = {(q['issue_id'], q['frame']): q[schema.BOOK_CHANGES] for q in books(tmp_path / 'repaired')}
+    lost_one = {(q['issue_id'], q['frame']): q[schema.BOOK_CHANGES] for q in books(a)}
+    assert repaired[(0, 24)] != lost_one[(0, 24)], "7203's update after the ones it lost changes from the update before it now"
+    plain = package(tmp_path, 'plain', 0, 80, received=7)
+    with pytest.raises(ValueError, match='book changes'):
+        repair(a, plain, tmp_path / 'mixed')
 
 
 def stamped(first, last):

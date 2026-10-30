@@ -6,7 +6,7 @@
 //!     brisk-parquet state --spool DIR --midnight NS --state-out FILE [--cut-state FILE --cut-clock US] [--day-start PART]
 //!                         [--parts-file FILE] [PART...]
 //!     brisk-parquet part --out DIR --midnight NS [--threads N]    (the decoder's JSON lines on stdin)
-//!     brisk-parquet schemas DIRECTORY
+//!     brisk-parquet schemas DIRECTORY [--depths changes]
 //!
 //! The parts of `package` and `state` are those `--parts-file` names (one path per line, UTF-8; `-` reads them from stdin), then
 //! the positional ones: a day has thousands, more than a Windows command line holds (32,767 characters), so briskapi sends them
@@ -35,7 +35,7 @@ const USAGE: &str = "usage: brisk-parquet verify DIRECTORY [--row-group ROWS] [-
     brisk-parquet state --spool DIR --midnight NS --state-out FILE [--cut-state FILE --cut-clock US] [--day-start PART] \
     [--parts-file FILE] [PART...]\n       \
     brisk-parquet part --out DIR --midnight NS [--threads N] < LINES\n       \
-    brisk-parquet schemas DIRECTORY";
+    brisk-parquet schemas DIRECTORY [--depths changes]";
 
 /// Arguments: `--flag value` pairs and the positional words.
 struct Args {
@@ -203,7 +203,15 @@ fn main() -> ExitCode {
         }
         Some("schemas") => match args.words.first() {
             Some(directory) => {
-                finish(brisk_parquet::writer::empty(&PathBuf::from(directory)).map(|()| json!({})))
+                let changes = match args.flags.get("depths").map(String::as_str) {
+                    None => false,
+                    Some("changes") => true,
+                    _ => return usage(),
+                };
+                finish(
+                    brisk_parquet::writer::empty(&PathBuf::from(directory), changes)
+                        .map(|()| json!({})),
+                )
             }
             None => usage(),
         },

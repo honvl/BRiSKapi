@@ -21,6 +21,8 @@ pub struct Table {
     pub name: &'static str,
     pub rows: usize,
     pub groups: usize,
+    /// A depths table whose quotes have book changes (`changes` and `checkpoint` columns).
+    pub changes: bool,
     reader: ArrowReaderMetadata,
 }
 
@@ -40,7 +42,7 @@ fn created_by_ok(text: &str) -> bool {
 
 /// Open a table, refusing a file that is not exactly the canonical structure: the schema, its metadata, full row
 /// groups, zstd, and column chunks that fill the file with nothing between them. `row_group` is the rows of a full group;
-/// `legacy` the format of 1.4 and before (v2).
+/// `legacy` the format of 1.4 and before (v2). A depths table in the current format may have its quotes' book changes.
 pub fn open(directory: &Path, name: &'static str, row_group: usize, legacy: bool) -> Res<Table> {
     let path = directory.join(name);
     require!(path.is_file(), format!("Missing {name}"));
@@ -59,7 +61,14 @@ pub fn open(directory: &Path, name: &'static str, row_group: usize, legacy: bool
     let reader =
         ArrowReaderMetadata::try_new(std::sync::Arc::new(meta.clone()), ArrowReaderOptions::new())?;
 
-    let expected = schema::expected(name, legacy);
+    let mut expected = schema::expected(name, legacy);
+    let changes = name == schema::DEPTHS
+        && !legacy
+        && !same_schema(reader.schema(), &expected)
+        && same_schema(reader.schema(), &schema::depths(true));
+    if changes {
+        expected = schema::depths(true);
+    }
     require!(
         same_schema(reader.schema(), &expected),
         format!("Unexpected schema in {name}")
@@ -125,10 +134,18 @@ pub fn open(directory: &Path, name: &'static str, row_group: usize, legacy: bool
     };
     for group in meta.row_groups() {
         decoded = decoded.saturating_add(group.total_byte_size());
-        // Book sides hold at most LEVELS entries; skipped issues at most the master.
-        let limit = limit_rows.saturating_mul(group.num_rows().max(1));
+        // Book sides hold at most LEVELS entries, book changes and checkpoints whole books; skipped issues at most the master.
+        let rows = group.num_rows().max(1);
+        let limit = limit_rows.saturating_mul(rows);
+        let whole = ((schema::BOOKS.len() * schema::MAX_BOOK_LEVELS) as i64).saturating_mul(rows);
         require!(
-            group.columns().iter().all(|c| c.num_values() <= limit),
+            group.columns().iter().all(|c| {
+                let held = matches!(
+                    c.column_path().parts().first().map(String::as_str),
+                    Some(schema::CHANGES | schema::CHECKPOINT)
+                );
+                c.num_values() <= if held { whole } else { limit }
+            }),
             format!("Oversized column in {name}")
         );
     }
@@ -140,6 +157,7 @@ pub fn open(directory: &Path, name: &'static str, row_group: usize, legacy: bool
         name,
         rows: rows as usize,
         groups,
+        changes,
         reader,
     })
 }

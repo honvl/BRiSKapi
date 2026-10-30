@@ -36,9 +36,10 @@ import zipfile
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from briskapi.schema import (LEGACY_SCHEMA, BATCH_KEYS, LEVELS, MASTER_KEYS, MAX_COMPRESSED, QUOTE_KEYS, SCHEMA, SKIPPED,
+from briskapi.schema import (BOOK_CHANGES, CHECKPOINT_CHANGES, MAX_BOOK_LEVELS, apply_changes, LEGACY_SCHEMA, BATCH_KEYS, LEVELS, MASTER_KEYS, MAX_COMPRESSED, QUOTE_KEYS, SCHEMA, SKIPPED,
                              TRADE_KEYS, canonical, encode, require, validate_batches,
                              validate_manifest)
 from briskapi.schema import broker as is_broker
@@ -71,6 +72,11 @@ TIME = pa.timestamp('ns', tz='UTC')
 LEVEL = pa.struct([pa.field('price', DECIMAL, False), pa.field('size', DECIMAL, False),
                    pa.field('count', pa.uint32(), False), pa.field('order_id', pa.uint64(), False)])
 BOOK = pa.list_(pa.field('item', LEVEL, False))
+# A broker quote's book changes (schema.BOOK_CHANGES), and an issue's whole books at a checkpoint: `book` is the index in
+# schema.BOOKS (bids, asks, then the closing-condition orders'), each book's best price first.
+CHANGE = pa.struct([pa.field('book', pa.uint8(), False), pa.field('price', DECIMAL, False), pa.field('size', DECIMAL, False),
+                    pa.field('count', pa.uint32(), False)])
+CHANGES = pa.list_(pa.field('item', CHANGE, False))
 
 # The decoder's quote, in its own order. Prices are tenths of a yen and times microseconds after
 # JST midnight; zero means none.
@@ -113,6 +119,9 @@ DEPTH_SCHEMA = pa.schema([
     pa.field('closing_bids', BOOK, False), pa.field('closing_asks', BOOK, False),
 ], metadata={'type_name': 'OrderBookDepth', 'price_precision': '1', 'size_precision': '0', 'brisk_format': SCHEMA})
 V2_DEPTH = ['bids', 'asks', 'flags', 'sequence', 'ts_event', 'ts_init']
+# A recording whose quotes have book changes (a broker's from 1.9.0 on) has two more columns: `changes` (the quote's
+# own) and `checkpoint` (null but every CHECKPOINT_CHANGES changes of an issue: its whole books after this quote).
+DEPTH_CHANGES_SCHEMA = DEPTH_SCHEMA.append(pa.field('changes', CHANGES, False)).append(pa.field('checkpoint', CHANGES))
 
 TRADE_SCHEMA = pa.schema([
     # NautilusTrader v2 TradeTick, plus the identifier of its multi-instrument queries
@@ -258,6 +267,48 @@ def _tenths(text) -> int:
     return int(match[1]) * 10 + int(match[2])
 
 
+def _offsets(counts, flat, width):
+    """(offsets, levels) of lists from their lengths and their values row after row (arrays of int64)."""
+    counts = np.frombuffer(counts, np.int64) if len(counts) else np.zeros(0, np.int64)
+    levels = np.frombuffer(flat, np.int64) if len(flat) else np.zeros(0, np.int64)
+    return np.concatenate([[0], np.cumsum(counts)]), levels.reshape(-1, width)
+
+
+def _gather(offsets, levels, idx):
+    """The lists of rows `idx`, in that order, as (offsets, levels)."""
+    counts = offsets[1:][idx] - offsets[:-1][idx]
+    new = np.concatenate([[0], np.cumsum(counts)])
+    return new, levels[np.arange(new[-1]) + np.repeat(offsets[:-1][idx] - new[:-1], counts)]
+
+
+def _concat_changes(pieces):
+    """The book changes of consecutive Columns, which all have them or none (those with no quotes, as a spool part of a history
+    batch alone is, say nothing)."""
+    pieces = [piece for piece in pieces if len(piece)]
+    have = {piece.changes is not None for piece in pieces}
+    require(len(have) <= 1, 'Quotes with and without book changes')
+    if have != {True}:
+        return None
+    counts = np.concatenate([np.diff(piece.changes[0]) for piece in pieces])
+    return np.concatenate([[0], np.cumsum(counts)]), np.concatenate([piece.changes[1] for piece in pieces])
+
+
+def _changes_of(decoded):
+    """The book changes of _decode_depths' columns, if its table has them."""
+    if 'changes.counts' not in decoded:
+        return None
+    return np.concatenate([[0], np.cumsum(decoded.pop('changes.counts'))]), decoded.pop('changes.levels')
+
+
+def _change_list(offsets, levels, nulls=None):
+    """A CHANGES column from (offsets, [book, price10, quantity, orders] levels); `nulls` marks rows without one."""
+    require(not len(levels) or (levels[:, 0].max() < len(BOOKS) and levels[:, 3].max() < 2**32), 'Invalid book change')
+    items = pa.StructArray.from_arrays([pa.array(levels[:, 0], pa.uint8()), _decimal(levels[:, 1], 1), _decimal(levels[:, 2], 0),
+                                        pa.array(levels[:, 3], pa.uint32())], fields=list(CHANGE))
+    return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), items, type=CHANGES,
+                                    mask=None if nulls is None else pa.array(nulls, pa.bool_()))
+
+
 class Columns:
     """A recording held as numpy columns in vendor units, sorted by issue then batch.
 
@@ -267,8 +318,9 @@ class Columns:
     `t` holds the trades (TRADE_INTS, `t_code` their codes), sorted by issue then the decoder's order.
     """
 
-    def __init__(self, q, code, books, master, batches, t, t_code, order=None):
+    def __init__(self, q, code, books, master, batches, t, t_code, order=None, changes=None):
         self.q, self.code, self.books, self.master, self.batches, self.order = q, code, books, master, batches, order
+        self.changes = changes   # the quotes' book changes, (offsets, levels) as a book side's with 4 columns; or None
         self.t, self.t_code = t, t_code
 
     def __len__(self):
@@ -289,6 +341,7 @@ class Columns:
                                               operator.itemgetter(*BOOKS))
         books = {side: (array('q'), array('q')) for side in BOOKS}
         sides = list(books.values())
+        change_counts, change_levels, with_changes = array('q'), array('q'), None
         t_seqs, t_flat, t_code = array('q'), array('q'), []
         rows, master = [], None
         try:
@@ -302,6 +355,9 @@ class Columns:
                             'Unknown or missing master fields')
                 quotes = b.get('quotes', ())
                 for q in quotes:
+                    if with_changes is None:
+                        with_changes = isinstance(q, dict) and BOOK_CHANGES in q
+                        quote_keys = quote_keys | {BOOK_CHANGES} if with_changes else quote_keys
                     require(isinstance(q, dict) and q.keys() == quote_keys, 'Unknown or missing quote fields')
                     flat.extend(quote_ints(q))
                     require(isinstance(q['code'], str), 'Invalid security code')
@@ -313,6 +369,14 @@ class Columns:
                             if type(level) is not list or len(level) != 3:
                                 raise ValueError('Invalid book level')
                             levels.extend(level)
+                    if with_changes:
+                        changes = q[BOOK_CHANGES]
+                        require(isinstance(changes, list), 'Invalid book changes')
+                        change_counts.append(len(changes))
+                        for change in changes:
+                            if type(change) is not list or len(change) != 4:
+                                raise ValueError('Invalid book change')
+                            change_levels.extend(change)
                 seqs.extend([b['seq']] * len(quotes))
                 trades = b.get('trades', ())
                 for t in trades:
@@ -334,21 +398,17 @@ class Columns:
             sides[side] = (np.concatenate([[0], np.cumsum(counts)]), (np.frombuffer(levels, np.int64) if len(levels)
                                                                          else np.zeros(0, np.int64)).reshape(-1, 3))
         master = sorted(master, key=lambda m: m['issue_id'] if type(m['issue_id']) is int else -1)
-        return cls(q, code, sides, master, rows, t, t_code, order=np.lexsort((q['seq'], q['issue_id'])))
+        changes = _offsets(change_counts, change_levels, 4) if with_changes else None
+        return cls(q, code, sides, master, rows, t, t_code, order=np.lexsort((q['seq'], q['issue_id'])), changes=changes)
 
     def sorted(self):
         return self if self.order is None else self.take(self.order)
 
     def take(self, idx):
         """These rows, in this order."""
-        books = {}
-        for side, (offsets, levels) in self.books.items():
-            counts = offsets[1:][idx] - offsets[:-1][idx]
-            new = np.concatenate([[0], np.cumsum(counts)])
-            gather = np.arange(new[-1]) + np.repeat(offsets[:-1][idx] - new[:-1], counts)
-            books[side] = (new, levels[gather])
+        books = {side: _gather(*book, idx) for side, book in self.books.items()}
         return Columns({k: v[idx] for k, v in self.q.items()}, self.code[idx], books, self.master, self.batches,
-                       self.t, self.t_code)
+                       self.t, self.t_code, changes=self.changes and _gather(*self.changes, idx))
 
     # Writing
 
@@ -366,9 +426,12 @@ class Columns:
             pq.write_table(self._equity(midnight), directory / EQUITY, row_group_size=ROW_GROUP, **options(EQUITY))
             pq.write_table(self._batches(midnight), directory / BATCHES, row_group_size=ROW_GROUP, **options(BATCHES))
             order = np.arange(len(self)) if self.order is None else self.order
-            with pq.ParquetWriter(directory / DEPTHS, DEPTH_SCHEMA, **options(DEPTHS)) as writer:
+            points = self.checkpoints(order) if self.changes else None
+            with pq.ParquetWriter(directory / DEPTHS, DEPTH_CHANGES_SCHEMA if self.changes else DEPTH_SCHEMA,
+                                  **options(DEPTHS)) as writer:
                 for start in range(0, len(self), ROW_GROUP):
-                    writer.write_table(self.take(order[start:start + ROW_GROUP])._depths(midnight), row_group_size=ROW_GROUP)
+                    writer.write_table(self.take(order[start:start + ROW_GROUP])._depths(
+                        midnight, points and points[start:start + ROW_GROUP]), row_group_size=ROW_GROUP)
             with pq.ParquetWriter(directory / TRADES, TRADE_SCHEMA, **options(TRADES)) as writer:
                 for start in range(0, len(self.t_code), ROW_GROUP):
                     writer.write_table(self._trades(midnight, slice(start, start + ROW_GROUP)), row_group_size=ROW_GROUP)
@@ -408,7 +471,24 @@ class Columns:
                    pa.array(t['side'], pa.uint8())]
         return pa.Table.from_arrays(columns, schema=TRADE_SCHEMA)
 
-    def _depths(self, midnight):
+    def checkpoints(self, order):
+        """Each row's checkpoint (rows in `order`, an issue's in batch order): None, or its issue's whole books after it,
+        as [book, price10, quantity, orders] rows, each book's best first, once CHECKPOINT_CHANGES changes since the
+        last (or since the issue's first row, which holds its books whole) have been applied."""
+        offsets, levels = self.changes
+        issues, out, previous = self.q['issue_id'][order], [None] * len(order), None
+        for at, row in enumerate(order.tolist()):
+            changes = levels[offsets[row]:offsets[row + 1]].tolist()
+            if issues[at] != previous:
+                books, count, previous = [{} for _ in BOOKS], -len(changes), issues[at]
+            apply_changes(books, changes)
+            count += len(changes)
+            if count >= CHECKPOINT_CHANGES:
+                out[at] = [[k, price, *books[k][price]] for k in range(len(BOOKS)) for price in sorted(books[k], reverse=k % 2 == 0)]
+                count = 0
+        return out
+
+    def _depths(self, midnight, checkpoints=None):
         q = self.q
         books = []
         for side in BOOKS:
@@ -427,7 +507,14 @@ class Columns:
                    *[_decimal(q[k], 1, nulls=True) for k in PRICES],
                    *[pa.array(q[k], pa.uint64()) for k in COUNTS],
                    pa.array(midnight + special * 1000, TIME, mask=special == 0), _decimal(q['turnover10'], 1), *books[2:]]
-        return pa.Table.from_arrays(columns, schema=DEPTH_SCHEMA)
+        if self.changes is None:
+            return pa.Table.from_arrays(columns, schema=DEPTH_SCHEMA)
+        points = checkpoints or [None] * len(self)
+        flat = [level for point in points if point is not None for level in point]
+        sizes = np.array([0 if point is None else len(point) for point in points], np.int64)
+        columns += [_change_list(*self.changes), _change_list(np.concatenate([[0], np.cumsum(sizes)]),
+                                                        np.array(flat, np.int64).reshape(-1, 4), [p is None for p in points])]
+        return pa.Table.from_arrays(columns, schema=DEPTH_CHANGES_SCHEMA)
 
     def _equity(self, midnight):
         rows = []
@@ -477,14 +564,18 @@ class Columns:
         for table in groups:
             for name, values in _decode_depths(table, midnight).items():
                 parts.setdefault(name, []).append(values)
-        empty = {'code': np.zeros(0, object), **{f'{side}.levels': np.zeros((0, 3), np.int64) for side in BOOKS}}
+        changed = 'changes' in pq.read_schema(directory / DEPTHS).names
+        empty = {'code': np.zeros(0, object), **{f'{side}.levels': np.zeros((0, 3), np.int64) for side in BOOKS},
+                 'changes.levels': np.zeros((0, 4), np.int64)}
+        sides = (*BOOKS, 'changes') if changed else BOOKS
         merged = {name: np.concatenate(parts.pop(name)) if name in parts else empty.get(name, np.zeros(0, np.int64))
-                  for name in (*INTS, 'code', *(f'{side}.{part}' for side in BOOKS for part in ('counts', 'levels')))}
+                  for name in (*INTS, 'code', *(f'{side}.{part}' for side in sides for part in ('counts', 'levels')))}
         books = {side: (np.concatenate([[0], np.cumsum(merged.pop(f'{side}.counts'))]), merged.pop(f'{side}.levels'))
-                 for side in BOOKS}
+                 for side in sides}
+        changes = books.pop('changes', None)
         filters = None if issue_id is None else [('issue_id', '=', issue_id)]
         t, t_code = _decode_trades(pq.read_table(directory / TRADES, filters=filters), midnight)
-        return cls({k: merged[k] for k in INTS}, merged['code'], books, master, batches, t, t_code)
+        return cls({k: merged[k] for k in INTS}, merged['code'], books, master, batches, t, t_code, changes=changes)
 
     def quotes(self, idx) -> list[dict]:
         """Quote dicts (as the decoder emits them) for these rows."""
@@ -497,7 +588,13 @@ class Columns:
             flat = levels[np.arange(bounds[-1]) + np.repeat(offsets[:-1][idx] - bounds[:-1], counts)].tolist()
             bounds = bounds.tolist()
             values[side] = [flat[bounds[i]:bounds[i + 1]] for i in range(len(idx))]
-        return [dict(zip(QUOTE_ORDER, row)) for row in zip(*(values[k] for k in QUOTE_ORDER))]
+        if self.changes is None:
+            return [dict(zip(QUOTE_ORDER, row)) for row in zip(*(values[k] for k in QUOTE_ORDER))]
+        new, levels = _gather(*self.changes, idx)
+        flat, bounds = levels.tolist(), new.tolist()
+        values[BOOK_CHANGES] = [flat[bounds[i]:bounds[i + 1]] for i in range(len(idx))]
+        keys = (*QUOTE_ORDER, BOOK_CHANGES)
+        return [dict(zip(keys, row)) for row in zip(*(values[k] for k in keys))]
 
     def _by_batch(self):
         """The quote and trade rows in batch order, and their batches."""
@@ -560,7 +657,7 @@ class Columns:
         t_code = np.concatenate([c.t_code for c in pieces])
         t_order = np.lexsort((np.arange(len(t_code)), t['seq'], t['issue_id']))
         return cls(q, code, books, master, [b for c in pieces for b in c.batches], {k: v[t_order] for k, v in t.items()},
-                   t_code[t_order], order=np.lexsort((q['seq'], q['issue_id'])))
+                   t_code[t_order], order=np.lexsort((q['seq'], q['issue_id'])), changes=_concat_changes(pieces))
 
     def trades_at(self, idx) -> list[dict]:
         """Trade dicts (as the decoder emits them) for these trade rows."""
@@ -665,6 +762,13 @@ def _decode_depths(table, midnight):
         out[f'{side}.counts'] = np.diff(bounds)
         out[f'{side}.levels'] = (np.stack([_integers(items.field('price'), 1), _integers(items.field('size'), 0),
                                            _numbers(items.field('count'))], axis=1) if len(items) else np.zeros((0, 3), np.int64))
+    if 'changes' in table.column_names:
+        column = table.column('changes').combine_chunks()
+        items = column.flatten()
+        out['changes.counts'] = np.diff(column.offsets.to_numpy().astype(np.int64))
+        out['changes.levels'] = (np.stack([_numbers(items.field('book')), _integers(items.field('price'), 1),
+                                           _integers(items.field('size'), 0), _numbers(items.field('count'))], axis=1)
+                                 if len(items) else np.zeros((0, 4), np.int64))
     return out
 
 
@@ -721,7 +825,10 @@ def check(directory, broker=None, fmt=None):
         path = directory / name
         require(path.is_file(), f'Missing {name}')
         meta = pq.ParquetFile(path).metadata
-        require(meta.schema.to_arrow_schema().equals(schemas[name], check_metadata=True), f'Unexpected schema in {name}')
+        arrow = meta.schema.to_arrow_schema()
+        # A broker's depths may have its quotes' book changes (DEPTH_CHANGES_SCHEMA), in this format only.
+        changed = name == DEPTHS and broker and fmt == SCHEMA and arrow.equals(DEPTH_CHANGES_SCHEMA, check_metadata=True)
+        require(changed or arrow.equals(schemas[name], check_metadata=True), f'Unexpected schema in {name}')
         require(re.fullmatch(r'(parquet-cpp-arrow|parquet-rs) version \d{1,4}\.\d{1,4}\.\d{1,4}', meta.created_by or '')
                 and set(meta.metadata or {}) == {b'ARROW:schema', *schemas[name].metadata}
                 and all(meta.metadata[k] == v for k, v in schemas[name].metadata.items()), f'Unexpected file metadata in {name}')
@@ -742,8 +849,11 @@ def check(directory, broker=None, fmt=None):
             group = meta.row_group(i)
             decoded += group.total_byte_size
             for c in range(group.num_columns):
-                # Book sides hold at most LEVELS entries; skipped issues at most the master.
-                limit = (max_rows[EQUITY] if name == BATCHES else LEVELS) * max(group.num_rows, 1)
+                # Book sides hold at most LEVELS entries, book changes and checkpoints whole books; skipped issues at
+                # most the master.
+                whole = group.column(c).path_in_schema.split('.')[0] in ('changes', 'checkpoint')
+                limit = (max_rows[EQUITY] if name == BATCHES else len(BOOKS) * MAX_BOOK_LEVELS if whole else LEVELS) \
+                    * max(group.num_rows, 1)
                 require(group.column(c).num_values <= limit, f'Oversized column in {name}')
         require(decoded <= max_decoded, f'{name} exceeds decode limit')
     return fmt
@@ -774,7 +884,7 @@ def _part_columns(part, midnight, master, issues=None):
     q = _decode_depths(pq.read_table(part / DEPTHS, filters=filters), midnight)
     books = {side: (np.concatenate([[0], np.cumsum(q.pop(f'{side}.counts'))]), q.pop(f'{side}.levels')) for side in BOOKS}
     t, t_code = _decode_trades(pq.read_table(part / TRADES, filters=filters), midnight)
-    return Columns({k: q[k] for k in INTS}, q['code'], books, master, batches, t, t_code)
+    return Columns({k: q[k] for k in INTS}, q['code'], books, master, batches, t, t_code, changes=_changes_of(q))
 
 
 # Sizes in canonical JSON (schema.encode), as the archive's summary counts them, from the columns: a quote's
@@ -811,6 +921,12 @@ def quote_lengths(columns):
         per_level = (_digits(levels).sum(axis=1) + 4) if len(levels) else np.zeros(0, np.int64)   # '[', ']', two ','
         running = np.concatenate([[0], np.cumsum(per_level)])
         total += 2 + running[offsets[1:]] - running[offsets[:-1]] + np.maximum(counts - 1, 0)
+    if columns.changes is not None:
+        # One more key, its comma, and its list of [book, price10, quantity, orders].
+        offsets, levels = columns.changes
+        per_level = (_digits(levels).sum(axis=1) + 5) if len(levels) else np.zeros(0, np.int64)   # '[', ']', three ','
+        running = np.concatenate([[0], np.cumsum(per_level)])
+        total += len(BOOK_CHANGES) + 4 + 2 + running[offsets[1:]] - running[offsets[:-1]] + np.maximum(np.diff(offsets) - 1, 0)
     return total
 
 
@@ -861,7 +977,7 @@ def _depth_rows(table, midnight, master):
     q = _decode_depths(table, midnight)
     books = {side: (np.concatenate([[0], np.cumsum(q.pop(f'{side}.counts'))]), q.pop(f'{side}.levels')) for side in BOOKS}
     t, t_code = _no_trades()
-    return Columns({k: q[k] for k in INTS}, q['code'], books, master, [], t, t_code)
+    return Columns({k: q[k] for k in INTS}, q['code'], books, master, [], t, t_code, changes=_changes_of(q))
 
 
 def _join(pieces):
@@ -871,7 +987,7 @@ def _join(pieces):
     return Columns({k: np.concatenate([r.q[k] for r in pieces]) for k in INTS}, np.concatenate([r.code for r in pieces]),
                    {side: (np.concatenate([[0], np.cumsum(np.concatenate([np.diff(r.books[side][0]) for r in pieces]))]),
                            np.concatenate([r.books[side][1] for r in pieces])) for side in BOOKS},
-                   pieces[0].master, [], *_no_trades())
+                   pieces[0].master, [], *_no_trades(), changes=_concat_changes(pieces))
 
 
 def state(directory, limit=None) -> dict[int, dict]:
@@ -1134,9 +1250,33 @@ def _with_init(table):
     return table.append_column(pa.field('ts_init', TIME, False), table.column('ts_event'))
 
 
+def _nautilus_deltas(rows, ident):
+    """An instrument's depth rows (with book changes, from its first) as v2 OrderBookDelta rows of its bid and ask books."""
+    from briskapi import records
+    deltas = records.deltas(rows, 0, records.Books())
+    deltas = deltas.filter(pc.invert(deltas.column('closing')))
+    n = deltas.num_rows
+    action = np.array([{'A': 1, 'M': 2, 'C': 3, 'R': 4}[a] for a in deltas.column('action').to_pylist()], np.uint8)
+    side = np.array([{'B': 1, 'A': 2, 'N': 0}[s] for s in deltas.column('side').to_pylist()], np.uint8)
+    ts = pc.cast(deltas.column('ts_event'), pa.int64()).to_numpy()
+    frames = deltas.column('sequence').to_numpy()
+    last = np.r_[(ts[1:] != ts[:-1]) | (frames[1:] != frames[:-1]), True] if n else np.zeros(0, bool)   # an update's last
+    flags = (deltas.column('flags').to_numpy() & F_SNAPSHOT) | np.where(last, 128, 0) | F_MBP
+    price = np.round(deltas.column('price').fill_null(0).to_numpy() * 10).astype(np.int64)
+    table = pa.table({'action': pa.array(action), 'side': pa.array(side), 'price': _decimal(price, 1),
+                      'size': _decimal(deltas.column('size').to_numpy().astype(np.int64), 0),
+                      'order_id': pa.array(np.zeros(n, np.uint64)), 'flags': pa.array(flags.astype(np.uint8)),
+                      'sequence': deltas.column('sequence'), 'ts_event': deltas.column('ts_event'), 'ts_init': deltas.column('ts_event')})
+    return table.replace_schema_metadata({'instrument_id': ident, 'price_precision': '1', 'size_precision': '0',
+                                          'type_name': 'OrderBookDelta'})
+
+
 def export_nautilus(directory, output) -> list[Path]:
     """Write a NautilusTrader v2 catalog: Equity, OrderBookDepth and TradeTick per instrument, and BriskQuote
-    as custom data.
+    as custom data; with book changes (a broker's recording from 1.9.0 on), also OrderBookDelta: every level of the
+    bid and ask books, a clear and the books whole at the instrument's first update (flagged F_SNAPSHOT), then each
+    level that appears, changes or empties (an update's last flagged F_LAST). The closing-condition orders' books,
+    which a Nautilus book has no place for, stay in BriskQuote.
 
     BriskQuote holds the rest of each quote in vendor units (prices in tenths of a yen, times in
     microseconds after JST midnight, zero for none), as int64 columns a v2 `customdataclass` can declare,
@@ -1178,6 +1318,8 @@ def export_nautilus(directory, output) -> list[Path]:
                                                      separators=(',', ':'))] * n)}
         put(output / 'data' / 'custom' / 'BriskQuote' / ident / span,
             pa.table(fields).replace_schema_metadata({'type_name': 'BriskQuote'}))
+        if 'changes' in rows.column_names:
+            put(output / 'data' / 'order_book_deltas' / ident / span, _nautilus_deltas(rows, ident))
 
     # An instrument at a time (rows are sorted by issue), a row group read at a time: never the whole in memory.
     source, current, tables, pieces = pq.ParquetFile(directory / DEPTHS), None, [], []

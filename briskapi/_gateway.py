@@ -646,6 +646,8 @@ class _Subscription:
         self.silent = silent   # kept for latest() only: no record is sent
         self.active = False    # gets the live batches (once the gateway has confirmed it, after any replay)
         self.bars = _Bars(records.BARS[schema]) if schema in records.BARS else None
+        # book-deltas: its securities' books, replayed from the day's start; whether its snapshot is out.
+        self.books, self.snapped = (records.Books() if schema == 'book-deltas' else None), not snapshot
 
 
 class _Bars:
@@ -833,7 +835,8 @@ class Live:
     def subscribe(self, dataset, schema, symbols='ALL_SYMBOLS', stype_in='raw_symbol', start=None, snapshot=False, stream=True):
         """Ask for `schema`'s records of `symbols` (JPX codes), before or during the session. `start` (a time, a
         date or UTC ns; 0 for all the feed has) replays from then; `snapshot` starts mbp-10, imbalance or
-        brisk-quotes with the current quotes. With `stream=False` no record is sent: the feed keeps these symbols' quotes
+        brisk-quotes with the current quotes. book-deltas needs `start` (its books are replayed from the day's start), and
+        with `snapshot` begins with each security's books as of then, as Historical's get_range(snapshot=True). With `stream=False` no record is sent: the feed keeps these symbols' quotes
         fresh for latest(), which reads them all at once when you need them (a session either streams or does this)."""
         if self._done.is_set():
             raise BriskError('This session has ended; start another Live')
@@ -845,10 +848,12 @@ class Live:
             raise ValueError(f'Unknown schema {schema!r}; one of {", ".join(records.SCHEMAS)}')
         if stype_in not in (None, '', 'raw_symbol'):
             raise ValueError('Only stype_in=raw_symbol (JPX codes) is supported')
-        if snapshot and start is not None:
+        if schema == 'book-deltas' and (start is None or not stream):
+            raise ValueError('book-deltas replays its books from the day\'s start: give start (0 for all the feed has)')
+        if snapshot and start is not None and schema != 'book-deltas':
             raise ValueError('Choose start (a replay) or snapshot (the current quotes), not both')
-        if snapshot and schema not in ('mbp-10', 'imbalance', 'brisk-quotes'):
-            raise ValueError('snapshot applies to mbp-10, imbalance and brisk-quotes')
+        if snapshot and schema not in ('mbp-10', 'imbalance', 'brisk-quotes', 'book-deltas'):
+            raise ValueError('snapshot applies to mbp-10, imbalance, brisk-quotes and book-deltas')
         if not stream and (start is not None or snapshot or schema not in ('mbp-10', 'imbalance', 'brisk-quotes')):
             raise ValueError('stream=False keeps quotes for latest(): mbp-10, imbalance or brisk-quotes, with no start or snapshot')
         if any(s.silent == stream for s in self._subscriptions):
@@ -914,7 +919,8 @@ class Live:
                 self._sock.sendall(_line({'subscribe': [s.id for s in subscriptions],
                                           'symbols': None if None in symbols else sorted(set().union(*symbols)),
                                           'replay': any(s.start is not None for s in subscriptions),
-                                          'snapshot': any(s.snapshot for s in subscriptions),
+                                          # book-deltas' snapshot is its own books, as of its start
+                                          'snapshot': any(s.snapshot and s.books is None for s in subscriptions),
                                           **({'silent': True} if subscriptions[0].silent else {})}))
         except OSError:
             raise BriskError('This session has ended; start another Live') from None
@@ -1125,7 +1131,7 @@ class Live:
         if self._by_rows and not snapshot and batch['type'] in ('quotes', 'history') \
                 and all(s.schema in ('mbp-10', 'trades', 'imbalance') for s in self._subscriptions):
             return self._rows(batch, takers, day)
-        quoted = ('mbp-10', 'imbalance', 'brisk-quotes')
+        quoted = ('mbp-10', 'imbalance', 'brisk-quotes', 'book-deltas')
         depths_wanted = any(s.schema in quoted for s in takers)
         # Trades are read whenever a subscription wants them (on the live day, any), so trade IDs carry on exactly.
         traders = takers if replayed else self._subscriptions
@@ -1138,6 +1144,10 @@ class Live:
             received = batch.get('received_unix_ms') if self.dataset == 'XTKS.BRISK' else None
             for index, s in enumerate(takers):
                 table = trades if s.schema == 'trades' or s.bars else depths if s.schema in quoted else None
+                if s.books is not None:
+                    if not snapshot and table is not None and table.num_rows:
+                        found += self._deltas(s, index, table, received, day)
+                    continue
                 if table is None or not table.num_rows or (snapshot and not s.snapshot):
                     continue
                 ts_recv = pa.array(np.full(table.num_rows, received * 10**6), records.TIME) if received else None
@@ -1149,11 +1159,36 @@ class Live:
         if not snapshot:
             clock = day.clock(batch)
             for index, s in enumerate(takers):
+                if s.books is not None and not s.snapped and (clock >= s.start or batch['type'] == 'end'):
+                    found += self._book_snapshot(s, index)
                 if s.bars:
                     found += _ordered(_bar_table(s.bars.ready(clock, final=batch['type'] == 'end'), publisher), s, index)
         if len(takers) > 1:
             found.sort(key=lambda item: item[:3])
         return [item[3] for item in found]
+
+    def _deltas(self, s, index, table, received, day):
+        """A book-deltas subscription's records of a batch's quotes (its symbols'), its books replayed through them; its
+        snapshot first, once the quotes reach its start (those before it go into the snapshot). A feed without book changes
+        (the demo's) has none, as the cloud API's recordings without them."""
+        if 'changes' not in table.column_names:
+            s.snapped = True
+            return []
+        if s.symbols is not None:
+            table = table.filter(pc.is_in(records.codes(table), value_set=pa.array(sorted(s.symbols))))
+        found = []
+        if not s.snapped:
+            early = pc.less(pc.cast(table.column('ts_event'), pa.int64()), s.start)
+            if not pc.all(early).as_py():
+                records.deltas(table.filter(early), records.DATASETS[self.dataset][0], s.books)
+                table = table.filter(pc.invert(early))
+                found += self._book_snapshot(s, index)
+        ts_recv = pa.array(np.full(table.num_rows, received * 10**6), records.TIME) if received else None
+        return found + _ordered(records.deltas(table, records.DATASETS[self.dataset][0], s.books, ts_recv, start=s.start), s, index)
+
+    def _book_snapshot(self, s, index):
+        s.snapped = True
+        return _ordered(records.book_snapshot(s.books, records.DATASETS[self.dataset][0]), s, index)
 
     def _rows(self, batch, takers, day):
         """_project for a live batch of mbp-10, trades and imbalance subscriptions alone, record by record: the same records, ordered
@@ -1292,7 +1327,7 @@ def _ordered(table, subscription, index):
     Historical's order."""
     if not table.num_rows:
         return []
-    if subscription.start is not None:
+    if subscription.start is not None and subscription.books is None:   # book-deltas applies its start itself
         table = table.filter(pc.greater_equal(pc.cast(table.column('ts_event'), pa.int64()), subscription.start))
     keys = [('ts_event', 'ascending'), ('instrument_id', 'ascending')]
     table = table.sort_by(keys + ([('sequence', 'ascending')] if 'sequence' in table.column_names else []))

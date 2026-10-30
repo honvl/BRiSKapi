@@ -15,13 +15,14 @@
    "start": "開始（含む）。ISO 8601 形式の時刻（タイムゾーンの指定がなければ JST）、日付（その取引日の JST 0時から）、または UTC ナノ秒。",
    "end": "終了（含まない）。形式は start と同じです。既定: start の取引日の終わり。`start` から最大31日後まで。どちらも2000年から2100年の間。",
    "symbols": "JPX の銘柄コード（`\"7203\"`、`\"167A\"`）を最大2,000銘柄。リストまたはカンマ区切りで指定します。既定: `\"ALL_SYMBOLS\"`。",
-   "schema": "`trades`（既定）、`mbp-10`、`definition`、`imbalance`、`brisk-quotes`、または `ohlcv-1s`、`ohlcv-1m`、`ohlcv-1h`、`ohlcv-1d`。[データ形式](/data-format.md)を参照してください。",
+   "schema": "`trades`（既定）、`mbp-10`、`book-deltas`、`definition`、`imbalance`、`brisk-quotes`、または `ohlcv-1s`、`ohlcv-1m`、`ohlcv-1h`、`ohlcv-1d`。[データ形式](/data-format.md)を参照してください。",
    "stype_in": "`raw_symbol`（JPX の銘柄コード）のみ。",
    "stype_out": "`instrument_id` のみ。どのレコードにも銘柄コードが `symbol` として入ります。",
    "limit": "返すレコード数の上限（時刻順に並べたあとで適用）。",
    "path": "レコードを Parquet としてこのファイルにも書き出します。",
    "ts_filter": "`start`・`end`・並び順に使う時計。`ts_event`（既定。BRiSK のタイムスタンプで、どの記録に含まれていても同じ行が返ります）または `ts_recv`（自分のコンピューターが受信した時刻。先読みをしてはならないテスト向け）。クラウド API は `ts_event` でしか絞り込めないので、`ts_recv` では前後 `skew` 秒を広げて要求し、残りはクライアントで絞り込みます（`limit` はそのあとに適用）。バーには使えません。",
-   "skew": "`ts_filter=\"ts_recv\"` のとき、期間の前後に広げる秒数（既定 10）。BRiSK のタイムスタンプが受信側の時計より、この半分を超えて先行していたときは警告します。"
+   "skew": "`ts_filter=\"ts_recv\"` のとき、期間の前後に広げる秒数（既定 10）。BRiSK のタイムスタンプが受信側の時計より、この半分を超えて先行していたときは警告します。",
+   "snapshot": "`book-deltas` で（`ts_event` により）: `start` 時点の各銘柄の板全体を、消去（`R`）とその価格帯（32 の印付き）として先頭に置きます。クラウド API が各銘柄の最後のチェックポイントから組み立てます。既定は False。"
   }
  },
  "historical/timeseries/get_range_bars": {
@@ -32,20 +33,20 @@
    "start": "開始（含む）。ISO 8601 形式の時刻（タイムゾーンの指定がなければ JST）、日付（その取引日の JST 0時から）、または UTC ナノ秒。",
    "end": "終了（含まない）。形式は start と同じです。既定: start の取引日の終わり。`start` から最大31日後まで。どちらも2000年から2100年の間。",
    "symbols": "JPX の銘柄コード（`\"7203\"`、`\"167A\"`）を最大2,000銘柄。リストまたはカンマ区切りで指定します。既定: `\"ALL_SYMBOLS\"`。",
-   "schema": "`trades`（既定）、`mbp-10`、`definition`、`imbalance`、`brisk-quotes`、または `ohlcv-1s`、`ohlcv-1m`、`ohlcv-1h`、`ohlcv-1d`。[データ形式](/data-format.md)を参照してください。",
+   "schema": "`trades`（既定）、`mbp-10`、`book-deltas`、`definition`、`imbalance`、`brisk-quotes`、または `ohlcv-1s`、`ohlcv-1m`、`ohlcv-1h`、`ohlcv-1d`。[データ形式](/data-format.md)を参照してください。",
    "limit": "返すレコード数の上限（時刻順に並べたあとで適用）。"
   }
  },
  "historical/timeseries/get_snapshot": {
-  "text": "ある時点（含む）以前の、各銘柄の最新のレコードを返します。その時点の板そのものです。BRiSK は更新のたびに銘柄の状態全体を送るので、最後のレコードがその状態です。既定では時点を受信時計で測るので、フィードを受信しているプログラムがその時点で持っていたものが返ります。`since` 以降にレコードのない銘柄は含まれません。クライアント側で `get_range` を使って実装しており、エンドポイントは増えません。",
+  "text": "ある時点（含む）以前の、各銘柄の最新のレコードを返します。その時点の板そのものです。BRiSK は更新のたびに銘柄の状態全体を送るので、最後のレコードがその状態です。既定では時点を受信時計で測るので、フィードを受信しているプログラムがその時点で持っていたものが返ります。`since` 以降にレコードのない銘柄は含まれません。クライアント側で `get_range` を使って実装しており、エンドポイントは増えません。 `book-deltas` では、BRiSK のタイムスタンプによるその時点の各銘柄の板全体（消去と価格帯）を、クラウド API が各銘柄の最後のチェックポイントから組み立てて返します。",
   "returns": "1銘柄1行（`instrument_id` 順）の [`DataStore`](/reference/historical/store/to_df.md)。",
   "params": {
    "dataset": "`XTKS.BRISK`（自分のライブ記録）または `XTKS.BRISKDEMO`（公開デモ。どの ID からでも照会できます）。",
    "at": "時点。ISO 8601 形式の時刻（タイムゾーンの指定がなければ JST）、日付（その取引日の JST 0時）、または UTC ナノ秒。ちょうどその時点のレコードも含みます。",
    "symbols": "JPX の銘柄コード（`\"7203\"`、`\"167A\"`）を最大2,000銘柄。リストまたはカンマ区切りで指定します。既定: `\"ALL_SYMBOLS\"`。",
-   "schema": "レコードのスキーマ: `brisk-quotes`（既定）、`mbp-10`、`imbalance`、`trades`、`definition`。バーは不可。",
+   "schema": "レコードのスキーマ: `brisk-quotes`（既定）、`mbp-10`、`book-deltas`、`imbalance`、`trades`、`definition`。バーは不可。",
    "since": "検索を始める時点。既定: `at` の取引日の JST 0時。取引時間中は、より遅い時点を渡してください（渡さないと午前のすべてを読みます）。",
-   "ts_filter": "`ts_recv`（既定: `at` までに受信していたもの）または `ts_event`（BRiSK のタイムスタンプ）。",
+   "ts_filter": "`ts_recv`（既定: `at` までに受信していたもの）または `ts_event`（BRiSK のタイムスタンプ。`book-deltas` ではこれだけ）。",
    "skew": "`ts_filter=\"ts_recv\"` のとき、期間の前後に広げる秒数（既定 10）。BRiSK のタイムスタンプが受信側の時計より、この半分を超えて先行していたときは警告します。",
    "path": "レコードを Parquet としてこのファイルにも書き出します。"
   }

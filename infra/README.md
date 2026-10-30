@@ -180,3 +180,8 @@ and execution roles/inline policies (`brisk-recorder-archive` and `brisk-recorde
 then remove all bucket object versions and delete
 the bucket. Removing the versioned bucket is an explicit destructive operation;
 the deployer does not do it automatically.
+
+Broker recordings from briskapi 1.9 on have two more columns in their depths table (book changes and
+checkpoints) and the `book-deltas` schema reads them. Deploy before releasing such a client: the
+archive's verifier (`brisk-parquet` in the archive function) refuses the extended table until it is
+updated, and the query function serves `book-deltas` only once it is.

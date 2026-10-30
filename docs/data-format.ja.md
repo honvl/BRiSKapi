@@ -51,8 +51,8 @@ briskapi が返す Parquet（および CSV と JSON）の中身を、列ごと�
 | `symbol` | string | JPX の銘柄コード（`map_symbols=False` では省かれます） |
 
 レコードは時刻順（`ts_event`、次に `instrument_id`、次に `sequence`）に並びます。自分の複数の記録が
-重なっている場合も、各レコードは1回だけ現れます。`briskapi.Live` は、フィードがバッチを受け取った
-順に、各バッチのレコードをこの順で届けます。
+重なっている場合も、各レコードは1回だけ現れます（`book-deltas` はそのうち1つを読みます。そちらを参照）。
+`briskapi.Live` は、フィードがバッチを受け取った順に、各バッチのレコードをこの順で届けます。
 
 ### `trades`
 
@@ -84,6 +84,31 @@ briskapi が返す Parquet（および CSV と JSON）の中身を、列ごと�
 | `ask_px_NN` | float64 | 売り板の NN 本目の価格（円。NN は最良の 00 から 09 まで）。最後の本より先は null |
 | `ask_sz_NN` | uint64 | 売り板の NN 本目の株数 |
 | `ask_ct_NN` | uint32 | 売り板の NN 本目の注文件数 |
+
+### `book-deltas`
+
+銘柄の板のすべての価格帯を、一日を通して、変わったところとして表します。Databento の MBO のレコードを、
+BRiSK が与える粒度（価格帯ごとの株数と注文件数。BRiSK に注文 ID はありません）にしたものです。記録の中で
+銘柄の最初の更新は、板を消去し（`R`）すべての価格帯を加え（`A`）、32 の印が付きます。その後の各更新は、
+現れた価格帯（`A`）、変わった価格帯（`M`）、空になった価格帯（`C`）ごとにレコードを持ち、最後のものに 128 の
+印が付きます。順に適用すると、各更新の時点の板全体（通常の買い板・売り板と、引け条件付き注文の板
+（`closing`））になります。`snapshot=True`（Historical の `get_range`、`brisk query --snapshot`、`start` を
+付けた `Live.subscribe`）では、開始時点の各銘柄の板が 32 の印付きで先に来るので、その後のレコードを既知の板に
+適用できます。`Historical.timeseries.get_snapshot(schema="book-deltas")` はそれだけを返します。クラウド API は、
+記録が 1,000 件の変更ごとに持つチェックポイントから組み立て、その日の始めからは読み直しません。briskapi 1.9
+より前の記録とデモの記録にはありません。その日の自分の記録が時間的に重なる場合は、長いほうを読みます。
+記録の変更は、それぞれその記録自身の直前の更新からのものだからです。
+
+| 列 | 型 | 意味 |
+| --- | --- | --- |
+| `action` | string | 'A' 価格帯が現れる、'M' 株数か注文件数が変わる、'C' 空になる、'R' 銘柄の板を消去する（スナップショットの価格帯が続く） |
+| `side` | string | 'B' 買いの価格帯、'A' 売りの価格帯、'R' では 'N' |
+| `closing` | bool | 通常の板ではなく、引け条件付き注文の板 |
+| `price` | float64 | 価格帯の価格（円）。'R' では null |
+| `size` | uint64 | この変更後の価格帯の株数（C では 0） |
+| `count` | uint32 | この変更後の価格帯の注文件数（C では 0） |
+| `flags` | uint8 | 更新の最後のレコードに 128。スナップショットのレコード（銘柄の最初の更新、または snapshot=true での開始時点の板）に 32 |
+| `sequence` | uint64 | BRiSK のフレーム番号 |
 
 ### `definition`
 
@@ -237,7 +262,7 @@ OHLCV バー（`ohlcv-1s` 〜 `ohlcv-1d`）は、クラウド API から、ま�
 
 | ファイル | 1行の単位 | 列 |
 | --- | --- | --- |
-| `data/order_book_depths.parquet` | 気配更新 | `bids`, `asks`（最大10本、最良が先頭：`price`, `size`, `count`、および v2 の `order_id`（常に 0））, `flags`, `sequence`（フレーム）, `ts_event`, `identifier`（`CODE.XTKS`）, `issue_id`, `seq`（バッチ）。続いて、上記の `brisk-quotes` と同じ気配の項目（価格は decimal） |
+| `data/order_book_depths.parquet` | 気配更新 | `bids`, `asks`（最大10本、最良が先頭：`price`, `size`, `count`、および v2 の `order_id`（常に 0））, `flags`, `sequence`（フレーム）, `ts_event`, `identifier`（`CODE.XTKS`）, `issue_id`, `seq`（バッチ）。続いて、上記の `brisk-quotes` と同じ気配の項目（価格は decimal）。briskapi 1.9 以降の証券会社の記録では、さらに `changes`（銘柄の直前の更新から4種類の板の何が変わったか：`book` は 0 が買い板、1 が売り板、2 と 3 が引け条件付き注文の板、`price`, `size`, `count`。空になった価格帯は 0 株。最初の更新は板全体を持つ）と `checkpoint`（null。ただし銘柄の変更 1,000 件ごとに、その時点の板全体を同じ形で） |
 | `data/trades.parquet` | 約定 | `price`, `size`, `aggressor_side`（`BUY`, `SELL`, `NO_AGGRESSOR`）, `trade_id`, `ts_event`, `identifier`, `issue_id`, `seq`, `frame`, `side`（BRiSK の種別そのまま：1 は買い手が仕掛けた、2 は売り手が仕掛けた） |
 | `data/equity.parquet` | 銘柄 | v2 の `Equity`: `id`（`CODE.XTKS`）, `raw_symbol`（銘柄コード）, `currency`, `price_precision`, `price_increment`, `lot_size`, `max_price`/`min_price`（その日の値幅制限）, `ts_event`/`ts_init`（日本時間0時）。続いて `issue_id`, `tick_type`, `issue_type`, `name`, `base_price` |
 | `data/custom/BriskBatch.parquet` | デコードしたバッチ（フレーム） | `seq`, `kind`（`bootstrap`, `history`, `quotes`, `end`）, `received_unix_ms`（ローカルの受信時刻）, `decode_ns`, `replay_lateness_ms`, `skipped_issues`, `frames`, `quote_updates`, `replay_wall_ms`（クラッシュ後に修復した日では、`end` の `frames` と `replay_wall_ms` は記録から組み立て直したもの）。`bootstrap` の行には `source`, `trading_date`, `input_transport`, `market_issue_count` |

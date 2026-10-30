@@ -183,9 +183,10 @@ for record in live:             # または live.add_callback(fn); live.start();
     print(record.schema, record.symbol, record.ts_event)
 ```
 
-- **スキーマ:** `trades`、`mbp-10`、`imbalance`、`definition`、`brisk-quotes`、OHLCV バーの
+- **スキーマ:** `trades`、`mbp-10`、`book-deltas`、`imbalance`、`definition`、`brisk-quotes`、OHLCV バーの
   `ohlcv-1s` 〜 `ohlcv-1d`。同じセッションなら `Historical` が返すのと同じ列・同じ値です。`Live` は
-  受け取った約定から、クラウドと同じ規則でバーを作ります。
+  受け取った約定から、クラウドと同じ規則でバーを作ります。`book-deltas` には `start` が必要です（その日の
+  これまでなら `0`）。板をその日の始めから再生し、`snapshot=True` ではその時点の各銘柄の板から始まります。
 - **バー**は、その区間がフィードの時計で終わりしだい届きます。終わりより後の時刻のバッチが届いたとき、
   またはこのコンピューターの時計から、BRiSK からこのセッションまでに測った遅延（直近10秒の最大値）を
   引いた時刻が終わりを過ぎたときです。自分のバーが終わったあとに届いた約定は、まだ終わっていない次の
@@ -713,7 +714,10 @@ schema='brisk-quotes', since=None)` は、`at` 時点の各銘柄の最新のレ
   `XTKS.BRISK` は自分のライブ記録で、どの証券会社の BRiSK 経由でも同じです。`XTKS.BRISKDEMO` は
   公開デモ（2021-09-27）で、どの ID からでも照会できます。
 - **スキーマ:** `trades`、`mbp-10`（各側10本。BRiSK は注文イベントではなく板を返すので、`action` と
-  `side` は `N`）、`definition`、`imbalance`（寄付きと引けの板寄せの状態：予想約定価格・数量、
+  `side` は `N`）、`book-deltas`（両方の板のすべての価格帯を一日を通して、Databento の MBO のレコードを
+  価格帯の粒度にしたもので表します：価格帯が現れる、変わる、空になる。`snapshot=True` では開始時点の各銘柄の
+  板全体が先に来て、`get_snapshot(schema="book-deltas")` はそれだけを返します。1.9 以降の証券会社の記録）、
+  `definition`、`imbalance`（寄付きと引けの板寄せの状態：予想約定価格・数量、
   成行注文の売買差）、`brisk-quotes`（BRiSK の気配のすべての項目）、そして OHLCV バーの
   `ohlcv-1s`、`ohlcv-1m`、`ohlcv-1h`、`ohlcv-1d`。`list_fields(schema)` でスキーマの列を確認できます。
 - **時刻:** 日付はその日の日本時間の取引日、タイムゾーンのない時刻は日本時間、整数は UTC のナノ秒を
@@ -730,7 +734,7 @@ schema='brisk-quotes', since=None)` は、`at` 時点の各銘柄の最新のレ
 11:31 までの記録なら、午前の1分と1時間のバーは受け取れますが、1日のバーは受け取れません。つまり、
 バーを得るにはアップロードが必要です。他の人のアップロードが自分のバーに入ることはなく、自分の
 アップロードが他の人のバーに入ることもありません（`XTKS.BRISKDEMO` のバーは、デモ自身の約定から
-作ります）。詳しくは [PRIVACY.ja.md](PRIVACY.ja.md)（ポリシーバージョン8）をご覧ください。`Ticker.candles()` は別のもので、
+作ります）。詳しくは [PRIVACY.ja.md](PRIVACY.ja.md)（ポリシーバージョン10）をご覧ください。`Ticker.candles()` は別のもので、
 証券会社の BRiSK 自身のバーです（証券会社へのログインが必要）。
 
 コマンドラインでは、`brisk query` は CSV を標準出力に書きます。`--encoding json` または `parquet` で

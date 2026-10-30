@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_writer::{ArrowColumnChunk, ArrowRowGroupWriterFactory, compute_leaves};
 use parquet::column::writer::ColumnCloseResult;
@@ -18,7 +18,6 @@ use parquet::file::statistics::{Statistics, ValueStatistics};
 use parquet::file::writer::SerializedFileWriter;
 
 use crate::error::{Failure, Res};
-use crate::schema;
 use crate::writer;
 
 /// What is done to a row group's rows before it is encoded (on a pool thread), and what is counted of them.
@@ -63,9 +62,11 @@ fn fault<E: Into<anyhow::Error>>(error: E) -> Failure {
 }
 
 impl Sink {
+    /// A sink for the table `name` of schema `schema` (the table's own, but for a depths table with book changes).
     pub fn create(
         directory: &Path,
         name: &str,
+        schema: Schema,
         row_group: usize,
         pool: Arc<rayon::ThreadPool>,
         stage: Stage,
@@ -73,6 +74,7 @@ impl Sink {
         Sink::create_with(
             directory,
             name,
+            schema,
             writer::properties(name, row_group),
             row_group,
             pool,
@@ -84,6 +86,7 @@ impl Sink {
     pub fn create_with(
         directory: &Path,
         name: &str,
+        schema: Schema,
         properties: WriterProperties,
         row_group: usize,
         pool: Arc<rayon::ThreadPool>,
@@ -93,7 +96,7 @@ impl Sink {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let schema: SchemaRef = Arc::new(schema::expected(name, false));
+        let schema: SchemaRef = Arc::new(schema);
         let file = BufWriter::with_capacity(1 << 20, File::create(path)?);
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(properties)).map_err(fault)?;
         let (file, factory) = writer.into_serialized_writer().map_err(fault)?;

@@ -25,7 +25,9 @@ DAY_NS = 86400 * 10**9
 DATASETS = {'XTKS.BRISK': (1, 'Tokyo Stock Exchange via BRiSK'),
             'XTKS.BRISKDEMO': (2, 'Tokyo Stock Exchange, BRiSK Next demo replay')}
 BARS = {'ohlcv-1s': 10**9, 'ohlcv-1m': 60 * 10**9, 'ohlcv-1h': 3600 * 10**9, 'ohlcv-1d': DAY_NS}
-SCHEMAS = ('trades', 'mbp-10', 'definition', 'imbalance', 'brisk-quotes', *BARS)
+SCHEMAS = ('trades', 'mbp-10', 'book-deltas', 'definition', 'imbalance', 'brisk-quotes', *BARS)
+# book-deltas' flags, Databento's: the last record of an update, and a snapshot's.
+F_LAST, F_SNAPSHOT = 128, 32
 # The Tokyo Stock Exchange's trading sessions since 2024-11-05, as [start, end) seconds after JST midnight;
 # the end second holds the closing auction's prints.
 SESSIONS = ((9 * 3600, 11 * 3600 + 30 * 60 + 1), (12 * 3600 + 30 * 60, 15 * 3600 + 30 * 60 + 1))
@@ -165,8 +167,8 @@ def project(schema, table, publisher, ts_recv=None, equity=None):
     if schema == 'imbalance':
         return _imbalance(table, head, symbols, equity)
     require(schema == 'brisk-quotes', f'No projection for {schema!r}')
-    # Everything BRiSK records for each update.
-    drop = {'identifier', 'ts_event', 'ts_init', 'issue_id', 'seq'}
+    # Everything BRiSK records for each update (its books ten levels deep: book-deltas has them whole).
+    drop = {'identifier', 'ts_event', 'ts_init', 'issue_id', 'seq', 'changes', 'checkpoint'}
     rest = {}
     for name in table.column_names:
         if name in drop:
@@ -175,6 +177,112 @@ def project(schema, table, publisher, ts_recv=None, equity=None):
         rest[name] = book(table.column(name)) if pa.types.is_list(kind) else \
             price(table.column(name)) if pa.types.is_decimal(kind) else table.column(name)
     return pa.table({**head, **rest, 'symbol': symbols})
+
+
+class Books:
+    """Each security's whole books (bid, ask, and the closing-condition orders' two) as book-deltas replays them:
+    {issue_id: four dicts of price10 to (quantity, orders)}, its code, and the frame, clock and receipt of the update
+    that left them so. Live keeps one from the session's start; the cloud API seeds one from each security's last
+    checkpoint (or its first quote) before the request's start."""
+
+    def __init__(self):
+        self.books, self.codes, self.last = {}, {}, {}
+
+    def seed(self, issue, code, checkpoint, frame, ts_event, ts_recv):
+        """A security's books are a checkpoint's ([book, price10, quantity, orders] rows), as of that update."""
+        books = [{} for _ in range(4)]
+        for book, price, quantity, orders in checkpoint:
+            books[book][price] = (quantity, orders)
+        self.books[issue], self.codes[issue], self.last[issue] = books, code, (frame, ts_event, ts_recv)
+
+    def levels(self, issue):
+        """A security's books as [book, price10, quantity, orders] rows, each book's best first."""
+        books = self.books[issue]
+        return [[k, price, *books[k][price]] for k in range(4) for price in sorted(books[k], reverse=k % 2 == 0)]
+
+
+def _levels(changes):
+    """Each row's book changes as [book, price10, quantity, orders] lists, from a depths table's `changes`."""
+    changes = changes.combine_chunks() if isinstance(changes, pa.ChunkedArray) else changes
+    values = changes.values
+    flat = np.stack([values.field('book').to_numpy(zero_copy_only=False).astype(np.int64),
+                     np.round(pc.cast(values.field('price'), pa.float64()).to_numpy(zero_copy_only=False) * 10).astype(np.int64),
+                     pc.cast(values.field('size'), pa.int64()).to_numpy(zero_copy_only=False),
+                     values.field('count').to_numpy(zero_copy_only=False).astype(np.int64)], axis=1).tolist() if len(values) else []
+    offsets = changes.offsets.to_numpy().tolist()
+    return [flat[offsets[i]:offsets[i + 1]] for i in range(len(changes))]
+
+
+class _Out:
+    """book-deltas records being made, column by column."""
+
+    def __init__(self):
+        self.columns = {name: [] for name, _, _ in FIELDS['book-deltas'] if name != 'publisher_id'}
+
+    def add(self, code, frame, ts_event, ts_recv, action, book, price, size, count, flags):
+        c = self.columns
+        c['ts_recv'].append(ts_recv); c['ts_event'].append(ts_event); c['instrument_id'].append(instrument_id(code))
+        c['action'].append(action); c['side'].append('N' if book is None else 'B' if book % 2 == 0 else 'A')
+        c['closing'].append(book is not None and book >= 2); c['price'].append(None if price is None else price / 10)
+        c['size'].append(size); c['count'].append(count); c['flags'].append(flags); c['sequence'].append(frame)
+        c['symbol'].append(code)
+
+    def whole(self, code, frame, ts_event, ts_recv, levels):
+        """A clear and the books' levels, flagged as a snapshot's."""
+        self.add(code, frame, ts_event, ts_recv, 'R', None, None, 0, 0, F_SNAPSHOT | (0 if levels else F_LAST))
+        for i, (book, price, quantity, orders) in enumerate(levels):
+            self.add(code, frame, ts_event, ts_recv, 'A', book, price, quantity, orders, F_SNAPSHOT | (F_LAST if i == len(levels) - 1 else 0))
+
+    def table(self, publisher):
+        c, n = self.columns, len(self.columns['action'])
+        kinds = {name: kind for name, kind, _ in FIELDS['book-deltas']}
+        return pa.table({name: (pa.array(np.full(n, publisher, np.uint16)) if name == 'publisher_id' else
+                                pa.array(c[name], pa.int64()).cast(TIME) if kinds[name] == TIME else pa.array(c[name], kinds[name]))
+                         for name in kinds})
+
+
+def deltas(table, publisher, books, ts_recv=None, start=None, first=None):
+    """book-deltas records from rows of a depths table that has book changes, by issue then batch, replayed onto
+    `books` (a Books, updated): each change is an add (a level the book lacked), a modify or a cancel (the level
+    emptied), an update's last flagged F_LAST. A security's first quote (`first`: whether each row is one; None: those
+    of issues `books` has not seen) clears its books and adds them whole, flagged F_SNAPSHOT. Rows before `start`
+    (UTC ns) are replayed but give no record."""
+    n, out = table.num_rows, _Out()
+    head, symbols = common(table, publisher, ts_recv)
+    issues, frames, codes_ = table.column('issue_id').to_pylist(), table.column('sequence').to_pylist(), symbols.to_pylist()
+    events, receipts = pc.cast(head['ts_event'], pa.int64()).to_pylist(), pc.cast(head['ts_recv'], pa.int64()).to_pylist()
+    changes = _levels(table.column('changes')) if n else []
+    for row in range(n):
+        issue, code, when = issues[row], codes_[row], (frames[row], events[row], receipts[row])
+        live = start is None or events[row] >= start
+        is_first = (issue not in books.books) if first is None else first[row]
+        if is_first:
+            books.books[issue] = [{} for _ in range(4)]
+            if live:
+                out.whole(code, *when, changes[row])
+        state, done = books.books[issue], len(changes[row]) - 1
+        for i, (book, price, quantity, orders) in enumerate(changes[row]):
+            had = price in state[book]
+            if quantity:
+                state[book][price] = (quantity, orders)
+            else:
+                state[book].pop(price, None)
+            if live and not is_first:
+                out.add(code, *when, 'C' if not quantity else 'M' if had else 'A', book, price, quantity, orders,
+                        F_LAST if i == done else 0)
+        books.codes[issue], books.last[issue] = code, when
+    return out.table(publisher)
+
+
+def book_snapshot(books, publisher, issues=None):
+    """book-deltas records of the securities' books as `books` holds them (those of `issues`, if given): each a clear and
+    its levels flagged F_SNAPSHOT, at the update that left them so, in Historical's order."""
+    out = _Out()
+    chosen = sorted(books.books if issues is None else set(issues) & books.books.keys(),
+                    key=lambda i: (books.last[i][1], instrument_id(books.codes[i]), books.last[i][0]))
+    for issue in chosen:
+        out.whole(books.codes[issue], *books.last[issue], books.levels(issue))
+    return out.table(publisher)
 
 
 def _imbalance(table, head, symbols, equity):
@@ -335,6 +443,16 @@ FIELDS = {
                   ('lower_collar', pa.float64(), "The day's lower price limit (yen)"),
                   ('auction_time', TIME, "When the special quote's timer ends; null without one"),
                   ('sequence', pa.uint64(), "BRiSK's frame number"), *_SYMBOL],
+    'book-deltas': [*_HEAD, ('action', pa.string(), "'A' a price level appears, 'M' its shares or orders change, 'C' it empties, "
+                                                   "'R' the security's books are cleared (a snapshot's levels follow)"),
+                    ('side', pa.string(), "'B' a bid level, 'A' an ask level, 'N' for 'R'"),
+                    ('closing', pa.bool_(), "The closing-condition orders' book, not the regular one"),
+                    ('price', pa.float64(), "The level's price (yen); null for 'R'"),
+                    ('size', pa.uint64(), 'Shares at the level after this event (0 for C)'),
+                    ('count', pa.uint32(), 'Orders at the level after this event (0 for C)'),
+                    ('flags', pa.uint8(), "128 on an update's last record; 32 on a snapshot's (a security's first update, "
+                                         "or the books as of the start with snapshot=true)"),
+                    ('sequence', pa.uint64(), "BRiSK's frame number"), *_SYMBOL],
     'brisk-quotes': [*_HEAD, *_quote_fields(), *_SYMBOL],
     **{schema: _BAR for schema in BARS},
 }

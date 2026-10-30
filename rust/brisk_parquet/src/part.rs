@@ -22,8 +22,8 @@ use crate::batches::{BOOTSTRAP, END, HISTORY, QUOTES};
 use crate::error::{Failure, Res};
 use crate::require;
 use crate::schema::{
-    self, BATCHES, COUNTS, DEPTHS, F_MBP, F_SNAPSHOT, PRICES, QUOTE_KEYS, TRADE_KEYS, TRADES,
-    VENUE_SUFFIX,
+    self, BATCHES, BOOK_CHANGES, COUNTS, DEPTHS, F_MBP, F_SNAPSHOT, PRICES, QUOTE_KEYS, TRADE_KEYS,
+    TRADES, VENUE_SUFFIX,
 };
 use crate::sink::{Sink, Stage};
 use crate::units::{tenths_raw, whole_raw};
@@ -51,6 +51,17 @@ fn slot_of(key: &str) -> usize {
         .expect("a quote key")
 }
 
+/// A quote's keys, and (last) the one a broker's quote may have for its book changes.
+const PART_QUOTE_KEYS: [&str; 44] = {
+    let mut keys = [BOOK_CHANGES; 44];
+    let mut i = 0;
+    while i < QUOTE_KEYS.len() {
+        keys[i] = QUOTE_KEYS[i];
+        i += 1;
+    }
+    keys
+};
+const CHANGES_SLOT: usize = 43;
 const CODE_SLOT: usize = 1;
 const BOOK_SLOTS: [usize; 4] = [31, 32, 33, 34];
 const QUOTE_ALL: u64 = (1 << 43) - 1;
@@ -70,6 +81,10 @@ struct QuoteCols {
     codes: Vec<u64>,
     seq: Vec<u64>,
     books: [Book; 4],
+    /// Whether the quotes have book changes (all do, or none), once there is a quote to say; and the changes, as a book's but
+    /// with four numbers to a level: book, price10, quantity, orders.
+    with_changes: Option<bool>,
+    changes: Book,
 }
 
 impl QuoteCols {
@@ -79,12 +94,21 @@ impl QuoteCols {
             codes: Vec::new(),
             seq: Vec::new(),
             books: Default::default(),
+            with_changes: None,
+            changes: Book::default(),
         }
     }
     fn len(&self) -> usize {
         self.codes.len()
     }
-    fn append(&mut self, other: QuoteCols) {
+    fn append(&mut self, other: QuoteCols) -> Res<()> {
+        require!(
+            self.with_changes
+                .zip(other.with_changes)
+                .is_none_or(|(a, b)| a == b),
+            "Quotes with and without book changes"
+        );
+        self.with_changes = self.with_changes.or(other.with_changes);
         for (a, b) in self.ints.iter_mut().zip(other.ints) {
             a.extend(b);
         }
@@ -94,6 +118,9 @@ impl QuoteCols {
             a.counts.extend(b.counts);
             a.levels.extend(b.levels);
         }
+        self.changes.counts.extend(other.changes.counts);
+        self.changes.levels.extend(other.changes.levels);
+        Ok(())
     }
 }
 
@@ -262,6 +289,59 @@ impl<'de> Visitor<'de> for Level<'_> {
     }
 }
 
+/// A quote's book changes: a list of [book, price10, quantity, orders].
+struct Changes<'a>(&'a mut Book);
+
+impl<'de> DeserializeSeed<'de> for Changes<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Changes<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("book changes")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let mut count = 0u32;
+        while seq.next_element_seed(Change(&mut self.0.levels))?.is_some() {
+            count += 1;
+        }
+        self.0.counts.push(count);
+        Ok(())
+    }
+}
+
+struct Change<'a>(&'a mut Vec<i64>);
+
+impl<'de> DeserializeSeed<'de> for Change<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Change<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a book change of four numbers")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        for _ in 0..4 {
+            match seq.next_element::<i64>()? {
+                Some(v) => self.0.push(v),
+                None => return Err(A::Error::custom("Invalid book change")),
+            }
+        }
+        if seq.next_element::<IgnoredAny>()?.is_some() {
+            return Err(A::Error::custom("Invalid book change"));
+        }
+        Ok(())
+    }
+}
+
 struct Quotes<'a>(&'a mut QuoteCols);
 
 impl<'de> DeserializeSeed<'de> for Quotes<'_> {
@@ -299,12 +379,14 @@ impl<'de> Visitor<'de> for OneQuote<'_> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         let cols = self.0;
         let mut seen = 0u64;
-        while let Some(slot) = map.next_key_seed(Key(&QUOTE_KEYS))? {
+        while let Some(slot) = map.next_key_seed(Key(&PART_QUOTE_KEYS))? {
             if seen & (1 << slot) != 0 {
                 return Err(A::Error::custom("Unknown or missing quote fields"));
             }
             seen |= 1 << slot;
-            if slot == CODE_SLOT {
+            if slot == CHANGES_SLOT {
+                map.next_value_seed(Changes(&mut cols.changes))?;
+            } else if slot == CODE_SLOT {
                 cols.codes.push(map.next_value_seed(Code)?);
             } else if let Some(side) = BOOK_SLOTS.iter().position(|b| *b == slot) {
                 map.next_value_seed(Levels(&mut cols.books[side]))?;
@@ -313,7 +395,9 @@ impl<'de> Visitor<'de> for OneQuote<'_> {
                 cols.ints[slot].push(value);
             }
         }
-        if seen != QUOTE_ALL {
+        // A chunk's quotes all have book changes, or none do.
+        let with = seen & (1 << CHANGES_SLOT) != 0;
+        if seen & QUOTE_ALL != QUOTE_ALL || *cols.with_changes.get_or_insert(with) != with {
             return Err(A::Error::custom("Unknown or missing quote fields"));
         }
         Ok(())
@@ -697,9 +781,64 @@ fn level_starts(book: &Book) -> Vec<usize> {
     starts
 }
 
+/// The quotes' book changes of the rows `order`, as the `changes` column. `starts`: where each row's changes begin.
+fn change_list(changes: &Book, order: &[u32], starts: &[usize]) -> Res<ArrayRef> {
+    let mut offsets = Vec::with_capacity(order.len() + 1);
+    offsets.push(0i32);
+    let (mut book, mut price, mut size, mut count) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for &i in order {
+        let i = i as usize;
+        let n = changes.counts[i] as usize;
+        let at = starts[i] * 4;
+        for change in changes.levels[at..at + n * 4].as_chunks::<4>().0 {
+            require!(
+                (0..schema::BOOKS.len() as i64).contains(&change[0])
+                    && (0..=u32::MAX as i64).contains(&change[3]),
+                "Invalid book change"
+            );
+            require!(change[1] >= 0 && change[2] >= 0, "Invalid negative value");
+            book.push(change[0] as u8);
+            price.push(tenths_raw(change[1] as u64));
+            size.push(whole_raw(change[2] as u64));
+            count.push(change[3] as u32);
+        }
+        offsets.push(offsets[offsets.len() - 1] + n as i32);
+    }
+    let decimals = |v: Vec<i128>| -> Res<ArrayRef> {
+        Ok(Arc::new(
+            Decimal128Array::from(v)
+                .with_precision_and_scale(38, 16)
+                .map_err(Failure::from)?,
+        ))
+    };
+    let items = StructArray::new(
+        schema::change_fields(),
+        vec![
+            Arc::new(UInt8Array::from(book)),
+            decimals(price)?,
+            decimals(size)?,
+            Arc::new(UInt32Array::from(count)),
+        ],
+        None,
+    );
+    let field = Arc::new(Field::new(
+        "item",
+        DataType::Struct(schema::change_fields()),
+        false,
+    ));
+    Ok(Arc::new(ListArray::new(
+        field,
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        Arc::new(items),
+        None,
+    )))
+}
+
 fn depth_batch(
     cols: &QuoteCols,
     starts: &[Vec<usize>; 4],
+    change_starts: &[usize],
     order: &[u32],
     midnight: i64,
 ) -> Res<RecordBatch> {
@@ -743,7 +882,13 @@ fn depth_batch(
     columns.push(tenths(&cols.ints[slot_of("turnover10")], order, false)?);
     columns.push(book(&cols.books[2], order, &starts[2])?);
     columns.push(book(&cols.books[3], order, &starts[3])?);
-    RecordBatch::try_new(Arc::new(schema::depth_schema()), columns).map_err(Failure::from)
+    let changed = cols.with_changes == Some(true);
+    if changed {
+        // The checkpoints are the packaging's: a part holds none.
+        columns.push(change_list(&cols.changes, order, change_starts)?);
+        columns.push(new_null_array(&schema::changes_type(), order.len()));
+    }
+    RecordBatch::try_new(Arc::new(schema::depths(changed)), columns).map_err(Failure::from)
 }
 
 fn trade_batch(cols: &TradeCols, order: &[u32], places: &[u64], midnight: i64) -> Res<RecordBatch> {
@@ -915,7 +1060,7 @@ pub fn write_part(input: &[u8], config: &PartConfig) -> Res<PartSummary> {
     for chunk in parsed {
         let chunk = chunk?;
         whole.batches.extend(chunk.batches);
-        whole.quotes.append(chunk.quotes);
+        whole.quotes.append(chunk.quotes)?;
         whole.trades.append(chunk.trades);
     }
     let midnight = config.midnight;
@@ -933,6 +1078,7 @@ pub fn write_part(input: &[u8], config: &PartConfig) -> Res<PartSummary> {
     let mut sink = Sink::create_with(
         out,
         BATCHES,
+        schema::expected(BATCHES, false),
         properties(BATCHES),
         schema::ROW_GROUP,
         pool.clone(),
@@ -943,6 +1089,7 @@ pub fn write_part(input: &[u8], config: &PartConfig) -> Res<PartSummary> {
     let mut depths = Sink::create_with(
         out,
         DEPTHS,
+        schema::depths(whole.quotes.with_changes == Some(true)),
         properties(DEPTHS),
         schema::ROW_GROUP,
         pool.clone(),
@@ -952,13 +1099,21 @@ pub fn write_part(input: &[u8], config: &PartConfig) -> Res<PartSummary> {
     let mut order: Vec<u32> = (0..n_quotes as u32).collect();
     order.sort_unstable_by_key(|&i| (issues[i as usize], whole.quotes.seq[i as usize], i));
     let starts: [Vec<usize>; 4] = [0, 1, 2, 3].map(|b| level_starts(&whole.quotes.books[b]));
+    let change_starts = level_starts(&whole.quotes.changes);
     for (a, b) in groups(issues, &order, schema::ROW_GROUP) {
-        depths.push_group(depth_batch(&whole.quotes, &starts, &order[a..b], midnight)?)?;
+        depths.push_group(depth_batch(
+            &whole.quotes,
+            &starts,
+            &change_starts,
+            &order[a..b],
+            midnight,
+        )?)?;
     }
     // Trades: by issue, then batch, then the decoder's order.
     let mut trades = Sink::create_with(
         out,
         TRADES,
+        schema::expected(TRADES, false),
         properties(TRADES),
         schema::ROW_GROUP,
         pool.clone(),

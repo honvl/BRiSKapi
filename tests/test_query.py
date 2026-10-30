@@ -22,6 +22,7 @@ import query_service
 from briskapi import _historical, identity
 from test_archive import (DB, OTHER, OWNER, S3, SECRET, isolated, packaged, stream, ticket_for, upload,  # noqa: F401
                           stored)
+from test_spool import with_book_changes
 
 JST = dt.timezone(dt.timedelta(hours=9))
 DATE = '20261013'
@@ -50,9 +51,9 @@ def cumulative(issue, second):
     return volume, turnover
 
 
-def session(first, last, date=DATE, source='brisk_live', lag_ms=20):
+def session(first, last, date=DATE, source='brisk_live', lag_ms=20, changes=False):
     """A broker session from `first` to `last` (seconds after 09:00), one quote batch per second, each received `lag_ms`
-    after BRiSK's stamp."""
+    after BRiSK's stamp; with `changes`, its quotes have book changes (as a broker's from 1.9.0 on)."""
     midnight_ms = int(dt.datetime.strptime(date, '%Y%m%d').replace(tzinfo=JST).timestamp() * 1000)
     master = [{**dict.fromkeys(schema.MASTER_KEYS, 0), 'issue_id': i, 'code': code, 'name': f'Issue {code}', 'lot_size': 100,
                'base_price10': 30000 if i == 0 else 5000, 'limit_up10': 39000 if i == 0 else 6500,
@@ -82,8 +83,9 @@ def session(first, last, date=DATE, source='brisk_live', lag_ms=20):
                             decode_ns=250_000, replay_lateness_ms=None, quotes=[quote(0, second), quote(1, second)],
                             trades=trades))
     n = len(batches)
-    return batches + [dict(type='end', seq=n, source_time_us=OPEN_US + last * 1_000_000, frames=n,
-                           quote_updates=2 * (n - 1), replay_wall_ms=1.0)]
+    batches.append(dict(type='end', seq=n, source_time_us=OPEN_US + last * 1_000_000, frames=n,
+                        quote_updates=2 * (n - 1), replay_wall_ms=1.0))
+    return with_book_changes(batches) if changes else batches
 
 
 @pytest.fixture
@@ -546,7 +548,7 @@ def test_every_schema_returns_exactly_its_documented_fields(archive):
     """get_range's columns and types are FIELDS (metadata.list_fields), with data and without; docs/data-format.md
     describes each one."""
     s3, db, put = archive
-    put(session(0, 150))
+    put(session(0, 150, changes=True))
     root = Path(__file__).resolve().parents[1] / 'docs'
     docs, translated = ((root / name).read_text(encoding='utf-8')
                         for name in ('data-format.md', 'data-format.ja.md'))   # both name every field

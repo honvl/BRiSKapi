@@ -11,6 +11,8 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::schema::types::ColumnPath;
 
+use arrow_schema::Schema;
+
 use crate::error::{Failure, Res};
 use crate::schema;
 
@@ -81,27 +83,35 @@ pub type TableWriter = ArrowWriter<BufWriter<File>>;
 
 /// A writer for the table `name` under `directory` (its folders made).
 pub fn create(directory: &Path, name: &str, row_group: usize) -> Res<TableWriter> {
-    create_file(&directory.join(name), name, row_group)
+    create_file(
+        &directory.join(name),
+        name,
+        schema::expected(name, false),
+        row_group,
+    )
 }
 
-/// A writer for a table of the kind `name` in the file `path`.
-pub fn create_file(path: &Path, name: &str, row_group: usize) -> Res<TableWriter> {
+/// A writer for a table of the kind `name` and schema `schema` (the kind's own, but for a depths table with book changes) in
+/// the file `path`.
+pub fn create_file(path: &Path, name: &str, schema: Schema, row_group: usize) -> Res<TableWriter> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let file = BufWriter::with_capacity(1 << 20, File::create(path)?);
-    ArrowWriter::try_new(
-        file,
-        Arc::new(schema::expected(name, false)),
-        Some(properties(name, row_group)),
-    )
-    .map_err(|e| Failure::Fault(e.into()))
+    ArrowWriter::try_new(file, Arc::new(schema), Some(properties(name, row_group)))
+        .map_err(|e| Failure::Fault(e.into()))
 }
 
-/// An empty table of each kind, to see the schemas as a reader sees them.
-pub fn empty(directory: &Path) -> Res<()> {
+/// An empty table of each kind, to see the schemas as a reader sees them; the depths table with its quotes' book changes if
+/// `changes`.
+pub fn empty(directory: &Path, changes: bool) -> Res<()> {
     for name in schema::FILES {
-        create(directory, name, schema::ROW_GROUP)?
+        let schema = if changes && name == schema::DEPTHS {
+            schema::depths(true)
+        } else {
+            schema::expected(name, false)
+        };
+        create_file(&directory.join(name), name, schema, schema::ROW_GROUP)?
             .close()
             .map_err(|e| Failure::Fault(e.into()))?;
     }

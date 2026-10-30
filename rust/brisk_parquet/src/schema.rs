@@ -17,6 +17,15 @@ pub const FILES: [&str; 4] = [EQUITY, DEPTHS, TRADES, BATCHES];
 
 pub const ROW_GROUP: usize = 65_536;
 pub const LEVELS: usize = 10;
+/// A book's nonempty levels, at most (`MAX_BOOK_LEVELS`), and how many book changes of an issue make a checkpoint
+/// (`CHECKPOINT_CHANGES`; see `checkpoint_changes`).
+pub const MAX_BOOK_LEVELS: usize = 65_536;
+pub const CHECKPOINT_CHANGES: usize = 1000;
+/// The depths table's extra columns when its quotes have book changes.
+pub const CHANGES: &str = "changes";
+pub const CHECKPOINT: &str = "checkpoint";
+/// A quote's key for its book changes, in the decoder's JSON.
+pub const BOOK_CHANGES: &str = "book_changes";
 pub const F_MBP: u8 = 16;
 pub const F_SNAPSHOT: u8 = 32;
 
@@ -173,7 +182,44 @@ fn metadata(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         .collect()
 }
 
+/// A book change (or a level of a checkpoint): `book` is the index in `BOOKS`.
+pub fn change_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("book", DataType::UInt8, false),
+        Field::new("price", decimal(), false),
+        Field::new("size", decimal(), false),
+        Field::new("count", DataType::UInt32, false),
+    ])
+}
+
+pub fn changes_type() -> DataType {
+    DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Struct(change_fields()),
+        false,
+    )))
+}
+
+/// How many book changes of an issue make a checkpoint. A test may ask for fewer, by the environment variable
+/// `BRISK_PARQUET_CHECKPOINT_CHANGES` (the checkpoints a recording holds follow it, and so does its verifying).
+pub fn checkpoint_changes() -> i64 {
+    static COUNT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("BRISK_PARQUET_CHECKPOINT_CHANGES")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(CHECKPOINT_CHANGES as i64)
+    })
+}
+
 pub fn depth_schema() -> Schema {
+    depths(false)
+}
+
+/// The depths table's schema; with `changes`, for quotes that have book changes: their own, and a checkpoint (the issue's
+/// whole books, null but now and then).
+pub fn depths(changes: bool) -> Schema {
     let mut fields = vec![
         Field::new("bids", book(), false),
         Field::new("asks", book(), false),
@@ -194,6 +240,10 @@ pub fn depth_schema() -> Schema {
     fields.push(Field::new("turnover", decimal(), false));
     fields.push(Field::new("closing_bids", book(), false));
     fields.push(Field::new("closing_asks", book(), false));
+    if changes {
+        fields.push(Field::new(CHANGES, changes_type(), false));
+        fields.push(Field::new(CHECKPOINT, changes_type(), true));
+    }
     Schema::new_with_metadata(
         fields,
         metadata(&[

@@ -107,6 +107,7 @@ Databento のユーザーが期待する列が並びます。バー以外のス�
 | --- | --- | --- |
 | `trades` | `data/trades.parquet` | `action` は T。価格、数量。`side` は仕掛けた側から決める（`B` は買い手主導、`A` は売り手主導、それ以外は `N`。寄付きの約定の多くがこれ）。`sequence` = フレーム。`trade_id` |
 | `mbp-10` | `data/order_book_depths.parquet` | 気配の更新ごとに、更新後の各側の上位10本を `bid_px_00`、`bid_sz_00`、`bid_ct_00` … `ask_ct_09` に展開（その側の最後の本より先は null）。BRiSK が返すのは板であって、板を変えた注文ではないため、`action` と `side` は `N`、`depth` は 0、`price` は null、`size` は 0。最初のバッチ（ブートストラップ）の行にはスナップショットのフラグ（`flags` 32）が付く。 |
+| `book-deltas` | `data/order_book_depths.parquet` の `changes` と `checkpoint` | 両方の板（買い・売り、通常と引け条件付き）のすべての価格帯を一日を通して、Databento の MBO のレコードを価格帯の粒度にしたもので表す（BRiSK に注文 ID はない）。`action` は `A` 価格帯が現れる、`M` 変わる、`C` 空になる、`R` スナップショットの前に銘柄の板を消去する。`side`、`closing`、`price`、変更後の `size` と `count`（注文件数）。`flags` は更新の最後のレコードに 128、スナップショットのレコードに 32。記録の中で銘柄の最初の更新はスナップショット（`R` と価格帯）。リクエストごとに、エンジンは行グループの統計とチェックポイントの列から、`start` より前の各銘柄の最後のチェックポイント（パッケージ化のときに変更 1,000 件ごとに板全体を書く）を見つけ、多くともその数の変更を再生して、範囲内のレコードを返す。`snapshot=true` では、`start` 時点の各銘柄の板を先頭に置く。同じ日の重なる記録は統合しない（記録の変更はそれぞれその記録の直前の更新からのもの）。最も長い記録を読む。1.9 以降の証券会社の記録。デモにはない。 |
 | `imbalance` | 板寄せの項目 | BRiSK ならではのデータ。更新ごとに、寄付きの予想約定価格が表示されていれば寄付き（`O`）の行、引けの予想約定価格が表示されていれば引け（`C`）の行を、`auction_type` に出す。`ind_match_price` = 予想約定価格、`paired_qty` = 予想約定数量、`market_imbalance_qty`/`_side` = 成行の買い数量 − 売り数量、`bid_total_qty`/`ask_total_qty` = 板の合計（`C` では引けのもの）、collar = その日の値幅制限の価格、`auction_time` = 特別気配のタイマー。 |
 | `definition` | `data/equity.parquet` | 記録ごと・銘柄ごとに1行。タイムスタンプはその取引日の日本時間 0時: 銘柄コード、銘柄名、売買単位、呼値の単位、基準値、値幅制限、銘柄の種別と呼値の種別 |
 | `brisk-quotes`（独自） | depths のすべての列 | 更新ごとに BRiSK が記録するすべての項目: 引け条件付き注文の板、板の合計、特別気配の時刻（小数は float64） |
@@ -299,9 +300,14 @@ client.timeseries.get_snapshot("XTKS.BRISK", at="2026-10-13T08:59:58", schema="b
   レコードがない銘柄は含まれません。取引時間中は、より遅い `since` を渡してください（渡さないと午前の
   すべてを読みます）。
 - デモの再生には受信時計がなく、`ts_recv` は `ts_event` と同じです。そのため、どちらの絞り込みでも結果は一致します。
+- `get_range(..., schema="book-deltas", snapshot=True)`（フォームでは `snapshot=true`）は、`start` 時点の各銘柄の
+  板全体から始まります。`get_snapshot(dataset, at, symbols, schema="book-deltas")` はそれだけ（消去と価格帯、
+  32 の印付き）を、BRiSK のタイムスタンプで、各銘柄の最後のチェックポイントからサーバー側で組み立てて返します。
+  `since` は使いません。
 
 コマンドラインでは、`brisk query XTKS.BRISK --schema ohlcv-1m --symbols 7203 --start 2026-10-13` が
-CSV を標準出力に書きます（`--encoding json|parquet`、`--output FILE`、`--end`、`--limit`）。素の HTTP で
+CSV を標準出力に書きます（`--encoding json|parquet`、`--output FILE`、`--end`、`--limit`、`book-deltas` では
+`--snapshot`）。素の HTTP で
 呼ぶ場合は、`-L` を付けると大きな結果の 303 をたどり、その途中で curl はキーを外します。
 
 ```sh

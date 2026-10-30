@@ -10,6 +10,7 @@ pub mod master;
 pub mod package;
 pub mod part;
 pub mod parts;
+pub mod replay;
 pub mod rows;
 pub mod schema;
 pub mod sink;

@@ -115,7 +115,8 @@ def _flag(params, name, default):
 
 def _request(params):
     names = ('dataset', 'schema', 'symbols', 'start', 'end', 'limit', 'stype_in')
-    return engine.request(**{name: params[name] for name in names if name in params and params[name] != ''})
+    return engine.request(**{name: params[name] for name in names if name in params and params[name] != ''},
+                          snapshot=_flag(params, 'snapshot', False))
 
 
 def get_range(params, who, bucket, s3, db, address):

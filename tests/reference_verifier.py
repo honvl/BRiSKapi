@@ -3,6 +3,7 @@
 These were the archive's checks before brisk-parquet: each row group decoded to numpy, re-encoded and compared with the
 table read. They take minutes for a day, so only tests run them (tests/test_native.py)."""
 import datetime as dt
+import decimal
 import re
 from pathlib import Path
 
@@ -10,11 +11,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+import briskapi._parquet as _parquet
 from briskapi._parquet import (BATCHES, DEPTHS, EQUITY, KINDS, TRADES, BROKER_MAX_ROWS, Columns, _decode_batches,
                                _decode_equity, _decode_trades, _depth_rows, _no_trades, as_format, batch_lengths,
                                check, midnight_ns, quote_lengths, trade_lengths)
-from briskapi.schema import (LEVELS, MASTER_KEYS, MAX_DECODE_NS, MAX_HISTORY, MAX_SESSION_MS, SKIPPED, UNIX_MS, code, integer,
-                             measurement, require, transports, validate_manifest)
+from briskapi.schema import (BOOK_CHANGES, BOOKS, LEVELS, MASTER_KEYS, MAX_BOOK_LEVELS, MAX_DECODE_NS, MAX_HISTORY, MAX_SESSION_MS,
+                             SKIPPED, UNIX_MS, _changes, apply_changes, best, code, integer, measurement, require, transports,
+                             validate_manifest)
 from briskapi.schema import broker as is_broker
 from reference_package import _per_batch
 
@@ -127,6 +130,37 @@ def _monotonic(issues, values, carry):
     return ok
 
 
+class _Replay:
+    """The book changes of a broker's quotes, replayed a row group at a time (schema._scan's rule, and the checkpoints
+    Columns.checkpoints puts where it does): each issue's books and the changes counted since its last checkpoint carry on
+    from one row group to the next."""
+
+    def __init__(self):
+        self.issue, self.books, self.count = None, None, 0
+
+    def group(self, table, rows):
+        """Refuse the row group's quotes (`table` and its Columns `rows`, which have changes) unless their changes obey the
+        rules and the table's checkpoints are where they should be, with what they should hold."""
+        cells = table.column('checkpoint').to_pylist()
+        for at, q in enumerate(rows.quotes(np.arange(len(rows)))):
+            changes = q[BOOK_CHANGES]
+            if q['issue_id'] != self.issue:
+                self.issue, self.books, self.count = q['issue_id'], [{} for _ in BOOKS], -len(changes)
+            require(len(changes) <= len(BOOKS) * MAX_BOOK_LEVELS, 'Invalid book changes')
+            _changes(changes)
+            apply_changes(self.books, changes)
+            require(all(len(book) <= MAX_BOOK_LEVELS for book in self.books), 'Invalid book changes')
+            require(all(best(self.books, k) == q[name] for k, name in enumerate(BOOKS)), 'Book changes do not give the quote\'s book')
+            self.count += len(changes)
+            expected = None
+            if self.count >= _parquet.CHECKPOINT_CHANGES:
+                self.count = 0
+                expected = [{'book': k, 'price': decimal.Decimal(price) / 10, 'size': decimal.Decimal(quantity), 'count': orders}
+                            for k, book in enumerate(self.books)
+                            for price, (quantity, orders) in sorted(book.items(), reverse=k % 2 == 0)]
+            require(cells[at] == expected, f'Non-canonical {DEPTHS}')
+
+
 def verify_broker(directory, manifest=None, progress=None):
     """Verify a broker's recording (all four tables, in `directory`) a row group at a time, never whole in memory:
     exactly the expected tables, each row group the canonical encoding of its content (so nothing but the
@@ -168,11 +202,13 @@ def verify_broker(directory, manifest=None, progress=None):
                 f'{what} outside their batches')
         require(not len(seqs) or (times_us <= clocks[seqs]).all(), f'{what} after their batch clock')
 
-    source = pq.ParquetFile(directory / DEPTHS)
+    source, replay = pq.ParquetFile(directory / DEPTHS), _Replay()
     for g in range(source.num_row_groups):
         table = source.read_row_group(g)
         rows = _depth_rows(table, midnight, master)
-        require(table.equals(as_format(rows._depths(midnight), DEPTHS, fmt)), f'Non-canonical {DEPTHS}')
+        # (A table's checkpoints are told apart: they follow the changes' replay below.)
+        without = lambda t: t.drop_columns(['checkpoint']) if 'checkpoint' in t.column_names else t  # noqa: E731
+        require(without(table).equals(without(as_format(rows._depths(midnight), DEPTHS, fmt))), f'Non-canonical {DEPTHS}')
         issue, seq = rows.q['issue_id'], rows.q['seq']
         identity(issue, rows.code)
         keys = issue << 32 | seq
@@ -195,6 +231,8 @@ def verify_broker(directory, manifest=None, progress=None):
                 step = np.diff(levels[:, 0])
                 order = step < 0 if side.startswith('bid') else step > 0
                 require(order[within].all(), 'Book prices out of order')
+        if rows.changes is not None:
+            replay.group(table, rows)
         quotes += _per_batch(seq, n)
         quote_bytes += int(quote_lengths(rows).sum())
     progress('verify: depths')

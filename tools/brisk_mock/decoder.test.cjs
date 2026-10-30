@@ -689,3 +689,79 @@ test('a quote worker\'s history keeps each issue\'s count and last price, and no
   assert.deepEqual([lean.size(2), lean.lastPrice10(2)], [2000, 7777]);
   assert.equal(full.take().length, 2000, 'the host\'s own history still reports its trades');
 });
+
+test('book changes replay to every level of all four books, the lists their best ten', { skip: !cache }, async () => {
+  const assets = loadAssets(cache);
+  const decoder = await Decoder.create(assets, { bookChanges: true });
+  const plain = await Decoder.create(assets);
+  const stream = frames(assets['ws.dat']), first = stream.next().value.data;
+  decoder.start(first);
+  plain.start(first);
+  const BOOKS = ['bid_levels', 'ask_levels', 'bid_closing_levels', 'ask_closing_levels'];
+  const TOTALS = ['bid_total', 'ask_total', 'bid_closing_total', 'ask_closing_total'];
+  const books = new Map();
+  let quotes = 0, removed = 0, deep = 0;
+  const check = (q, same) => {
+    quotes++;
+    assert.deepEqual({ ...q, book_changes: undefined }, { ...same, book_changes: undefined }, 'the quote is the plain decoder\'s');
+    const book = books.get(q.issue_id) ?? BOOKS.map(() => new Map());
+    if (!books.has(q.issue_id)) assert.ok(q.book_changes.every(([, , n]) => n), 'a first quote holds its whole book');
+    books.set(q.issue_id, book);
+    let last = null;
+    for (const [k, p, n, c] of q.book_changes) {
+      assert.ok(!last || k > last[0] || (k === last[0] && (k % 2 === 0 ? p < last[1] : p > last[1])), 'each book best first');
+      last = [k, p];
+      if (n) book[k].set(p, [n, c]);
+      else { assert.ok(book[k].delete(p) && c === 0, 'an emptied level the book had'); removed++; }
+    }
+    BOOKS.forEach((name, k) => {
+      const levels = [...book[k]].map(([p, [n, c]]) => [p, n, c]).sort((x, y) => (k % 2 === 0 ? y[0] - x[0] : x[0] - y[0]));
+      assert.deepEqual(levels.slice(0, 10), q[name], name);
+      deep += levels.length > 10;
+      assert.equal(levels.reduce((sum, level) => sum + level[1], 0), q[`${TOTALS[k]}_quantity`], `${name}: every share on the board`);
+      assert.equal(levels.reduce((sum, level) => sum + level[2], 0), q[`${TOTALS[k]}_orders`], `${name}: every order`);
+    });
+  };
+  const all = decoder.master.map(m => m.issue_id);
+  const pair = (a, b) => a.quotes.forEach((q, i) => check(q, b.quotes[i]));
+  pair(decoder.quotes(all), plain.quotes(all));
+  let n = 0;
+  for (const frame of stream) {
+    decoder.feed(frame.data);
+    plain.feed(frame.data);
+    const changed = decoder.changed();
+    assert.deepEqual(changed, plain.changed());
+    pair(decoder.quotes(changed), plain.quotes(changed));
+    if (++n === 3000) break;   // the opening's first 30 seconds: every security opens or is in its auction
+  }
+  assert.ok(quotes > 100000 && removed > 1000 && deep > 10000, JSON.stringify({ quotes, removed, deep }));
+  const toyota = decoder.master.find(m => m.code === '7203').issue_id;
+  assert.ok([...books.get(toyota)[0].keys()].length > 500, 'Toyota\'s bids before the open: hundreds of levels');
+});
+
+test('book changes are the same from the board kernel and from the _getItaRows walk, and across a switch between them', { skip: !cache }, async () => {
+  const assets = loadAssets(cache);
+  const create = () => Decoder.create(assets, { bookChanges: true });
+  const [walk, kernel, off, on] = await Promise.all([create(), create(), create(), create()]);
+  const stream = frames(assets['ws.dat']), first = stream.next().value.data;
+  for (const d of [walk, kernel, off, on]) d.start(first);
+  for (const d of [walk, on]) [d.board, d.boardRetry] = [null, null];   // the walk only (on: until it is found)
+  assert.ok(kernel.board && off.board);
+  const all = walk.master.map(m => m.issue_id);
+  const read = ids => [walk, kernel, off, on].map(d => d.quotes(ids).quotes);
+  const same = ([w, ...others]) => others.forEach(o => assert.deepEqual(o, w));
+  same(read(all));
+  let n = 0;
+  for (const frame of stream) {
+    for (const d of [walk, kernel, off, on]) d.feed(frame.data);
+    const changed = walk.changed();
+    for (const d of [kernel, off, on]) assert.deepEqual(d.changed(), changed);
+    same(read(changed));
+    if (++n === 300) {
+      off.board = null;   // its last ladders, kept in the decoder's memory, are compared in JavaScript from now on
+      assert.ok(on.discoverBoard());   // those it kept in arrays go into the decoder's memory for the kernel
+    }
+    if (n === 900) break;
+  }
+  assert.ok(kernel.board && on.board && !off.board && !walk.board);
+});

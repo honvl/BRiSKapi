@@ -60,8 +60,8 @@ GET_RANGE_PARAMS = [
       'most 31 days after `start`; both between 2000 and 2100.'),
     P('symbols', 'Iterable[str] | str', 'Up to 2,000 JPX codes (`"7203"`, `"167A"`), as a list or comma-separated. Default '
       '`"ALL_SYMBOLS"`.'),
-    P('schema', 'str', '`trades` (default), `mbp-10`, `definition`, `imbalance`, `brisk-quotes` or `ohlcv-1s`, `ohlcv-1m`, '
-      '`ohlcv-1h`, `ohlcv-1d`. See [Data format](/data-format.md).'),
+    P('schema', 'str', '`trades` (default), `mbp-10`, `book-deltas`, `definition`, `imbalance`, `brisk-quotes` or `ohlcv-1s`, '
+      '`ohlcv-1m`, `ohlcv-1h`, `ohlcv-1d`. See [Data format](/data-format.md).'),
     P('stype_in', 'str', 'Only `raw_symbol` (JPX codes).'),
     P('stype_out', 'str', 'Only `instrument_id`; every record also has its code in `symbol`.'),
     P('limit', 'int | None', 'The most records to return, after time-ordering.'),
@@ -72,6 +72,8 @@ GET_RANGE_PARAMS = [
       'with `limit` applied after. Not for bars.'),
     P('skew', 'float', 'Seconds of padding either side of the window for `ts_filter="ts_recv"` (default 10). A warning says when '
       'BRiSK\'s stamps ran ahead of the receipt clock by more than half of it.'),
+    P('snapshot', 'bool', 'For `book-deltas` (by `ts_event`): begin with each security\'s whole books as of `start`, a clear (`R`) '
+      'and its levels flagged 32, rebuilt by the cloud API from the security\'s last checkpoint. Default False.'),
 ]
 
 STORE = CLIENT + RANGE
@@ -95,7 +97,7 @@ CLOUD = [
            'Historical.timeseries.get_range(\n    dataset: str,\n    start: str | int | date,\n    end: str | int | date | None = None,\n'
            '    symbols: Iterable[str] | str = "ALL_SYMBOLS",\n    schema: str = "trades",\n    stype_in: str = "raw_symbol",\n'
            '    stype_out: str = "instrument_id",\n    limit: int | None = None,\n    path: str | Path | None = None,\n'
-           '    ts_filter: str = "ts_event",   # or "ts_recv"\n    skew: float = 10.0,\n) -> DataStore',
+           '    ts_filter: str = "ts_event",   # or "ts_recv"\n    skew: float = 10.0,\n    snapshot: bool = False,\n) -> DataStore',
            GET_RANGE_PARAMS, 'A [`DataStore`](/reference/historical/store/to_df.md) of the records.',
            {'Python': CLIENT + 'data = client.timeseries.get_range(\n    dataset="XTKS.BRISKDEMO",\n    symbols=["7203"],\n'
             '    schema="trades",\n    start="2021-09-27T09:00",\n    end="2021-09-27T09:01",\n    limit=1,\n)\n'
@@ -121,21 +123,23 @@ CLOUD = [
            'The latest record of each security at or before a moment: its book as it stood. BRiSK sends a security\'s whole '
            'state on every update, so the last record is the state. By default the moment is on the receipt clock, so it '
            'holds what a program receiving the feed would have held then. A security with no record since `since` is '
-           'absent. Implemented in the client over `get_range`; it adds no endpoint.',
+           'absent. Implemented in the client over `get_range`; it adds no endpoint. For `book-deltas`, each security\'s whole '
+           'books as of the moment by BRiSK\'s stamp: a clear and its levels, rebuilt by the cloud API from its last checkpoint.',
            'Historical.timeseries.get_snapshot(\n    dataset: str,\n    at: str | int | date,\n    symbols: Iterable[str] | str = "ALL_SYMBOLS",\n'
-           '    schema: str = "brisk-quotes",\n    since: str | int | date | None = None,\n    ts_filter: str = "ts_recv",\n'
+           '    schema: str = "brisk-quotes",\n    since: str | int | date | None = None,\n    ts_filter: str | None = None,\n'
            '    skew: float = 10.0,\n    path: str | Path | None = None,\n) -> DataStore',
            [P('dataset', 'str', '`XTKS.BRISK` (your own live recordings) or `XTKS.BRISKDEMO` (the public demo, open to every identity).',
               required=True),
             P('at', 'str | int | date', 'The moment: an ISO 8601 time (JST unless it names a zone), a date (that trading day, from '
               'JST midnight) or UTC nanoseconds. Records at exactly this moment count.', required=True),
             GET_RANGE_PARAMS[3],
-            P('schema', 'str', 'A record schema: `brisk-quotes` (default), `mbp-10`, `imbalance`, `trades` or `definition`; not '
-              'bars.'),
+            P('schema', 'str', 'A record schema: `brisk-quotes` (default), `mbp-10`, `book-deltas`, `imbalance`, `trades` or '
+              '`definition`; not bars.'),
             P('since', 'str | int | date | None', 'Where the search starts. Default: the JST midnight of `at`\'s trading day. '
               'During the session pass a later one, or the search reads the whole morning.'),
-            P('ts_filter', 'str', '`ts_recv` (default: what had been received by `at`) or `ts_event` (BRiSK\'s stamp).'),
-            GET_RANGE_PARAMS[-1], GET_RANGE_PARAMS[8]],
+            P('ts_filter', 'str | None', '`ts_recv` (the default: what had been received by `at`) or `ts_event` (BRiSK\'s stamp, '
+              'and the only one for `book-deltas`).'),
+            GET_RANGE_PARAMS[-2], GET_RANGE_PARAMS[8]],
            'A [`DataStore`](/reference/historical/store/to_df.md) with one row per security, in `instrument_id` order.',
            {'Python': CLIENT + 'snap = client.timeseries.get_snapshot(\n    dataset="XTKS.BRISKDEMO",\n    at="2021-09-27T09:00:00",\n'
             '    symbols=["7203", "6758"],\n    schema="brisk-quotes",\n)\n'

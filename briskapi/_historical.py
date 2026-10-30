@@ -202,7 +202,7 @@ class _Timeseries:
         self._client = client
 
     def get_range(self, dataset, start, end=None, symbols='ALL_SYMBOLS', schema='trades', stype_in='raw_symbol',
-                  stype_out='instrument_id', limit=None, path=None, ts_filter='ts_event', skew=10.0) -> DataStore:
+                  stype_out='instrument_id', limit=None, path=None, ts_filter='ts_event', skew=10.0, snapshot=False) -> DataStore:
         """Records of `schema` for `symbols` (JPX codes) in [start, end), merged across your recordings and
         time-ordered. `path` also writes them there (Parquet). Records carry both `instrument_id` and the code
         (`symbol`), so `stype_out` is `instrument_id` as Databento's default.
@@ -212,7 +212,12 @@ class _Timeseries:
         received the record: what a live program could have known by then (a replay's `ts_recv` is `ts_event`). The
         cloud API cuts only on `ts_event`, so a 'ts_recv' request asks for [start - skew, end + skew) seconds of it and
         cuts the rest here, with `limit` applied after; widen `skew` if BRiSK's stamps can run further ahead of the
-        receipt clock (a warning says when they came close). Not for OHLCV bars."""
+        receipt clock (a warning says when they came close). Not for OHLCV bars.
+
+        `snapshot` (book-deltas, by 'ts_event'): each security's whole books as of `start` come first, as a clear ('R')
+        and its levels flagged 32, so the records after them apply to known books."""
+        if snapshot and (schema != 'book-deltas' or ts_filter != 'ts_event'):
+            raise ValueError("snapshot is for book-deltas, with ts_filter='ts_event'")
         if stype_out != 'instrument_id':
             raise ValueError("stype_out is 'instrument_id'; each record also has its code in `symbol`")
         if ts_filter not in ('ts_event', 'ts_recv'):
@@ -222,7 +227,8 @@ class _Timeseries:
         else:
             data, _ = self._client._call('timeseries.get_range', dict(dataset=dataset, start=start, end=end, symbols=symbols,
                                                                       schema=schema, stype_in=stype_in, limit=limit,
-                                                                      encoding='parquet'), post=True)
+                                                                      encoding='parquet', **({'snapshot': True} if snapshot else {})),
+                                         post=True)
             store = DataStore(data, schema)
         if path:
             store.to_parquet(path)
@@ -252,16 +258,31 @@ class _Timeseries:
         table = table.sort_by(order + ([('sequence', 'ascending')] if 'sequence' in table.column_names else []))
         return DataStore.from_table(table.slice(0, int(limit)) if limit else table, schema)
 
-    def get_snapshot(self, dataset, at, symbols='ALL_SYMBOLS', schema='brisk-quotes', since=None, ts_filter='ts_recv',
+    def get_snapshot(self, dataset, at, symbols='ALL_SYMBOLS', schema='brisk-quotes', since=None, ts_filter=None,
                      skew=10.0, path=None) -> DataStore:
         """Each security's latest record of `schema` at or before `at`, one row per security, in `instrument_id` order:
         the book as it stood (BRiSK sends a security's state on every update, so the last one is its state; a security
         that had none since `since` is absent). `since` is where the search starts, default the JST midnight of `at`'s
         trading day (the pre-open hour holds few records; during the session pass a later `since`). `ts_filter` as in
-        get_range: the default 'ts_recv' returns what a program receiving the feed would have held at `at`."""
+        get_range: the default 'ts_recv' returns what a program receiving the feed would have held at `at`.
+
+        For book-deltas: each security's whole books as of `at` by BRiSK's stamp (ts_filter 'ts_event', the default
+        there), a clear ('R') then its levels, all flagged 32; the cloud API rebuilds them from the security's last
+        checkpoint, so `since` does not apply."""
         if schema in BARS:
             raise ValueError('A snapshot needs a record schema, not OHLCV bars')
         moment = timestamp(at)
+        if schema == 'book-deltas':
+            if ts_filter not in (None, 'ts_event') or since is not None:
+                raise ValueError("A book-deltas snapshot is by BRiSK's stamp (ts_filter='ts_event'), from each security's checkpoint")
+            table = self.get_range(dataset, moment + 1, moment + 2, symbols, schema, snapshot=True)._arrow()
+            table = table.filter(pc.and_(pc.equal(pc.bit_wise_and(table.column('flags'), 32), 32),
+                                         pc.less_equal(pc.cast(table.column('ts_event'), pa.int64()), moment)))
+            store = DataStore.from_table(table, schema)
+            if path:
+                store.to_parquet(path)
+            return store
+        ts_filter = ts_filter or 'ts_recv'
         floor = timestamp(since, default=(moment + JST_NS) // DAY_NS * DAY_NS - JST_NS)
         if floor > moment:
             raise ValueError('since is after at')
