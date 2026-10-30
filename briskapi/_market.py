@@ -1,7 +1,11 @@
 """Ticker and Market: auction data from a recording or live feed, plus your broker's BRiSK data."""
 from __future__ import annotations
 
-from briskapi._recording import NotFoundError, Recording, Table, master_view, quote_view, timestamp, trade_view
+from briskapi._recording import BriskError, NotFoundError, Recording, Table, master_view, quote_view, timestamp, trade_view
+from briskapi.schema import BOOK_CHANGES, BOOKS, apply_changes, best
+
+# Ticker.book's names for the books, as quote_view's.
+_BOOK_NAMES = ('bids', 'asks', 'closing_bids', 'closing_asks')
 
 
 def _default():
@@ -18,7 +22,7 @@ class Ticker:
     """Per-security auction data.
 
         t = Ticker("7203")
-        t.info(); t.quote(); t.quote(at="09:00:00"); t.history().to_pandas(); t.trades()
+        t.info(); t.quote(); t.quote(at="09:00:00"); t.book(at="09:00:00"); t.history().to_pandas(); t.trades()
         t.auction(); t.auction(closing=True)
         t.candles("5m"); t.margin()     # your broker's BRiSK session (briskapi.login)
     """
@@ -47,6 +51,28 @@ class Ticker:
         if quote is None:
             raise NotFoundError(f'No quote for {self.code} at {at}')
         return quote if raw else quote_view(quote, rec.trading_date)
+
+    def book(self, at=None, raw=False) -> dict:
+        """Every price level of the security's books at a JST time (default: the latest), not only the ten best that
+        quote() lists: its book changes replayed from the session's first update. A broker's recording or live feed
+        (with history=True) from briskapi 1.9 on. {'code', 'time', 'frame', 'bids', 'asks', 'closing_bids',
+        'closing_asks'}, each side best first as {'price', 'quantity', 'orders'}; raw: the decoder's [price10, quantity,
+        orders] lists under its own names (bid_levels ...) and source_time_us."""
+        rec = self.recording
+        books, last = [{} for _ in BOOKS], None
+        for quote in rec.book_updates(self.code, at):
+            if BOOK_CHANGES not in quote:
+                raise BriskError('This recording has no book changes: briskapi 1.9 or later records them, from a broker\'s BRiSK')
+            apply_changes(books, quote[BOOK_CHANGES])
+            last = quote
+        if last is None:
+            raise NotFoundError(f'No quote for {self.code} at {at}')
+        if raw:
+            return {'code': self.code, 'source_time_us': last['source_time_us'], 'frame': last['frame'],
+                    **{name: best(books, k, None) for k, name in enumerate(BOOKS)}}
+        return {'code': self.code, 'time': timestamp(rec.trading_date, last['source_time_us']), 'frame': last['frame'],
+                **{name: [{'price': p / 10, 'quantity': q, 'orders': n} for p, q, n in best(books, k, None)]
+                   for k, name in enumerate(_BOOK_NAMES)}}
 
     def history(self, start=None, end=None, raw=False) -> Table:
         """Every recorded update for this security, oldest first, optionally bounded by time.

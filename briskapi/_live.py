@@ -271,6 +271,12 @@ class Feed:
     def frames(self):
         raise BriskError('A live feed keeps no frames; record the session or load a recording')
 
+    def book_updates(self, code, at=None) -> Iterator[dict]:
+        """Raw updates received so far for one security to the time `at` (needs history=True): the retained history is
+        the session's (a new one, a reconnection's too, replaces it), from its first update, which holds the whole books,
+        so their book changes replay to the books then (Ticker.book)."""
+        return self.updates(code, None, at)
+
     def updates(self, code, start=None, end=None) -> Iterator[dict]:
         """Raw updates received so far for one security (needs history=True)."""
         if self._history is None:

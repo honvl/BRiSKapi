@@ -248,6 +248,14 @@
    "raw": "円と `datetime` の代わりに、BRiSK 自身の形式（0.1円単位、マイクロ秒）で返します。"
   }
  },
+ "python/ticker_book": {
+  "text": "ある時刻の銘柄の板のすべての価格帯です。`quote` が示す上位10本だけではありません。briskapi 1.9 以降の証券会社の記録またはライブフィード（`history=True`）の板の変更を、セッションの最初の更新から再生します。デモにはありません。複数日にわたる場合やレコードとしては、[`Historical`](/reference/historical/timeseries/get_range.md) の `book-deltas` を使ってください。",
+  "returns": "dict: `code`、`time`、`frame`、そして `bids`、`asks`、`closing_bids`、`closing_asks`（それぞれ最良が先頭の `{price, quantity, orders}`）。",
+  "params": {
+   "at": "JST の時刻（`\"09:00:00\"`）または `datetime`。既定は最新。",
+   "raw": "デコーダー自身のリスト（`bid_levels` など、`[price10, quantity, orders]`）と `source_time_us` で返します。"
+  }
+ },
  "python/ticker_history": {
   "text": "銘柄のすべての更新を、古い順に返します。読み込んだ記録（その範囲がそのまま）か、ライブフィード（`history=True` の場合は、接続してからのすべての更新）を読み、ネットワークは使いません。複数日にわたる場合は [`Historical`](/reference/historical/timeseries/get_range.md) を使ってください。",
   "returns": "`Table`（dict のリストで、`.to_pandas()` が使えます）。",

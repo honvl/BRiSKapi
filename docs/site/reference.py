@@ -355,6 +355,19 @@ TICKER = [
            {'Python': DEMO + 'quote = briskapi.Ticker("7203").quote(at="09:00:00")\n'
             'for key in ("time", "indicative_price", "indicative_volume",\n            "last_price", "bid_price", "ask_price", "volume"):\n'
             '    print(key, quote[key])'}),
+    Method('python/ticker_book', 'Ticker.book', 'Ticker.book',
+           'Every price level of a security\'s books at a time, not only the ten best `quote` lists: its book changes, replayed '
+           'from the session\'s first update, from a broker\'s recording or live feed (with `history=True`) of briskapi 1.9 or '
+           'later. The demo has none. Across days, or as records: `book-deltas` in [`Historical`](/reference/historical/timeseries/get_range.md).',
+           'briskapi.Ticker(code).book(\n    at: str | datetime | None = None,\n    raw: bool = False,\n) -> dict',
+           [P('at', 'str | datetime | None', 'A JST time (`"09:00:00"`) or `datetime`. Default: the latest.'),
+            P('raw', 'bool', 'The decoder\'s own lists (`bid_levels` …, `[price10, quantity, orders]`) and `source_time_us`.')],
+           'A dict: `code`, `time`, `frame`, and `bids`, `asks`, `closing_bids`, `closing_asks`, each best first as '
+           '`{price, quantity, orders}`.',
+           {'Python': 'import briskapi\n\nbriskapi.load("recordings/sbi_20261013_080100-113000")\nbook = briskapi.Ticker("7203").book(at="08:59:59")\n'
+            'print(len(book["bids"]), book["bids"][:2])'},
+           responses={'Python': "549 [{'price': 3021.0, 'quantity': 1200, 'orders': 3}, {'price': 3020.5, 'quantity': 800, 'orders': 2}]"},
+           illustrative=True),
     Method('python/ticker_history', 'Ticker.history', 'Ticker.history',
            'Every update of a security, oldest first. Reads the loaded recording (exactly its span) or the live feed (with '
            '`history=True`: every update since it connected); never the network. For more than one day, use '

@@ -10,7 +10,7 @@ import re
 from typing import Iterator
 
 from briskapi import _parquet
-from briskapi.schema import canonical_lines, encode, validate_stream
+from briskapi.schema import BOOK_CHANGES, canonical_lines, encode, validate_stream
 
 JST = dt.timezone(dt.timedelta(hours=9), 'JST')
 PRICES = ('last_price10', 'open_price10', 'bid_price10', 'ask_price10', 'indicative_price10',
@@ -97,7 +97,7 @@ def quote_view(quote: dict, date: str) -> dict:
             view['turnover'] = value / 10
         elif key == 'special_quote_time_us':
             view['special_quote_time'] = timestamp(date, value) if value else None
-        elif key not in view and key != 'source_time_us':
+        elif key not in view and key not in ('source_time_us', BOOK_CHANGES):   # the whole books: Ticker.book()
             view[key] = value
     special = quote.get('quote_flag') == 2
     view['special_quote'] = {'side': SIDES.get(quote['quote_side']), 'price': view.get('reference_price'),
@@ -271,6 +271,11 @@ class Recording:
             return _parquet.frames(self.directory)
         return [{**{k: v for k, v in b.items() if k not in ('master', 'quotes', 'trades')},
                  'quote_count': len(b.get('quotes', ())), 'trade_count': len(b.get('trades', ()))} for b in self.batches()]
+
+    def book_updates(self, code: str, at=None) -> Iterator[dict]:
+        """Raw quote updates for one security from its first of the session that holds the time `at` to `at`, whose
+        book changes replay to its whole books then (Ticker.book): a recording is one session."""
+        return self.updates(code, None, at)
 
     def updates(self, code: str, start=None, end=None) -> Iterator[dict]:
         """Raw quote updates for one security, skipping unrelated batches without parsing them."""

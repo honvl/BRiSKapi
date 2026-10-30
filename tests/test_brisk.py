@@ -21,7 +21,7 @@ import pytest
 import briskapi
 import briskapi.cli as cli
 import briskapi.schema as schema
-from briskapi import _live, _parquet, _spool, brisk
+from briskapi import _live, _parquet, _recording, _spool, brisk
 from briskapi._recording import JST, NotFoundError
 
 CHECK_SESSION = brisk._check_session  # stubbed for every test below; the session tests put it back
@@ -1212,3 +1212,24 @@ def test_every_broker_is_the_same_in_the_host_the_client_and_the_archive_schema(
     source = subprocess.run(['node', '-e', f"console.log(require({json.dumps(str(brisk.DECODER))}).SOURCE)"],
                             capture_output=True, text=True, check=True).stdout.strip()
     assert source == schema.BROKER_SOURCE
+
+
+def test_a_live_feeds_books_after_a_reconnection_replay_from_its_session(tmp_path, monkeypatch):
+    # A reconnection starts a session of its own (the feed's history is the session's), whose first quotes hold the whole
+    # books again: its books replay from there.
+    from test_api import deep_session
+    first, _ = deep_session(frames=12)
+    second, books = deep_session(frames=12, start=5, offset_us=60_000_000)
+    script = tmp_path / 'sbi_reconnect.cjs'
+    script.write_text(f"for (const b of {json.dumps(first + second)}) console.log(JSON.stringify(b));\n")
+    monkeypatch.setattr(brisk, 'DECODER', script)
+    monkeypatch.setenv('BRISK_SBI_COOKIES', '{"session_bfaf77a2": "v"}')
+    feed = briskapi.connect(site='sbi', codes=['7203'], history=True, upload=False).wait()
+    toyota = briskapi.Ticker('7203', feed)
+    quotes = [q for b in second for q in b.get('quotes', ()) if q['code'] == '7203']
+    for q in (quotes[3], quotes[-1]):
+        raw = toyota.book(at=_recording.timestamp(feed.trading_date, q['source_time_us']).time(), raw=True)
+        assert raw['frame'] == q['frame'] and raw['bid_levels'] == books[(0, q['frame'])][0]
+        assert raw['ask_levels'] == books[(0, q['frame'])][1] and len(raw['bid_levels']) == 15
+    with pytest.raises(briskapi.BriskError, match='history=True'):
+        briskapi.Ticker('7203', briskapi.connect(site='sbi', codes=['7203'], upload=False).wait()).book()

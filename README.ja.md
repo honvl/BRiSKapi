@@ -475,6 +475,7 @@ BRiSK の Cookie、`signin.client` がデータクライアントのある証券
 | `briskapi.Live()` | このコンピューターのフィードから Databento 風のライブのレコード: `subscribe(dataset, schema, symbols='ALL_SYMBOLS', start=None, snapshot=False, stream=True)`、`latest(schema=None, symbols=None)`（最新の気配のテーブル）のあと、イテレーション、または `add_callback(fn)` / `add_stream(path)` と `start()`、`block_for_close(timeout)`。`stop()`、`symbology_map`（[上記](#ライブのレコードdatabento-風)） |
 | `Ticker(code).info()` | 銘柄名、売買単位、呼値の種別、基準値、値幅制限 |
 | `Ticker(code).quote(at=None)` | 買い・売り気配とその数量・件数、板の各側の上位10本（`bids`、`asks`）と引け条件付き注文の上位10本（`closing_bids`、`closing_asks`）、板全体の注文合計、予想約定価格・数量、成行・引け条件付きの数量、直近の約定、売買代金、銘柄の状態、`special_quote`（特別気配の側・価格・タイマーの終了時刻） |
+| `Ticker(code).book(at=None)` | ある時刻の両方の板のすべての価格帯（`bids`、`asks`、`closing_bids`、`closing_asks`、最良が先頭）。上位10本だけではありません。1.9 以降の証券会社の記録またはライブフィード（`history=True`）の板の変更を、セッションの最初の更新から再生します |
 | `Ticker(code).auction(at=None, closing=False)` | 板寄せの予想状態、成行注文、板の合計と `market_order_imbalance`（成行の買い数量 − 売り数量）。`closing=True` で引けの板寄せ |
 | `Ticker(code).history(start, end)` | すべての更新（時系列順）。読み込んだ記録かフィードから（ネットワークは使わない） |
 | `Ticker(code).trades(start, end)` | すべての約定（歩み値）：時刻、価格、株数、仕掛けた側（`buy`、`sell`。寄付きの約定の多くは None）。読み込んだ記録かフィードから |

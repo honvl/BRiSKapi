@@ -190,7 +190,8 @@ replays at most that many changes; `snapshot` puts the books as of `start` first
 Overlapping recordings of a day are not merged: each one's changes are from its own previous
 update, so the longest is read (`_one_capture`). Live needs a `start` (its subscription replays the
 day from the spool to know the books) and stays on the recording's lane; the same functions make its
-records. `brisk repair` replays both recordings' changes into whole books, merges the rows and
+records. On this computer `Ticker.book()` replays a security's changes from its first update of the recording, or of the
+live feed's retained session (`history=True`; a reconnection's session replaces it), to the whole books at a time. `brisk repair` replays both recordings' changes into whole books, merges the rows and
 writes each security's changes again from row to row. The Nautilus export writes `OrderBookDelta`
 for the bid and ask books.
 

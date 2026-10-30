@@ -529,3 +529,51 @@ def test_cli_live(gated_decoder, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr()
     assert 'private archive' in out.err and '"uploaded": {"status": "stored"}' in out.err
     assert all('last_price10' in json.loads(line) for line in out.out.splitlines())
+
+
+def deep_session(frames=30, start=0, offset_us=0):
+    """A broker session whose quotes list their ten best levels while their book changes hold the whole books: fifteen
+    bids, and fifteen or twelve asks; the books of each update ({(issue, frame): four books}) with it."""
+    from test_spool import session
+    batches, before, books = session(frames=frames), {}, {}
+    for b in batches:
+        b['source_time_us'] += offset_us
+        for q in b.get('quotes', ()):
+            q['source_time_us'] += offset_us
+            k = q['frame'] + start
+            bids = [[9990 - 10 * n - k % 3, 100 * (n + 1) + k, 1 + n % 2] for n in range(15)]
+            asks = [[10010 + 10 * n + k % 2, 100 + n + k, 1] for n in range(15 if k % 4 else 12)]
+            whole = [bids, asks, [], []]
+            q['bid_levels'], q['ask_levels'] = bids[:10], asks[:10]
+            q[schema.BOOK_CHANGES] = schema.book_changes(before.get(q['issue_id']), whole)
+            before[q['issue_id']], books[(q['issue_id'], q['frame'])] = whole, whole
+    return batches, books
+
+
+def test_a_tickers_book_is_every_level_its_book_changes_replay_to(tmp_path):
+    batches, books = deep_session()
+    (tmp_path / 'deep.jsonl').write_bytes(b''.join(schema.encode(b) for b in batches))
+    cli.package(tmp_path / 'deep.jsonl', tmp_path / 'deep')
+    recording = brisk.Recording(tmp_path / 'deep')
+    toyota = brisk.Ticker('7203', recording)
+    quotes = [q for b in batches for q in b.get('quotes', ()) if q['code'] == '7203']
+    for q in quotes[::7] + quotes[-1:]:
+        at = _recording.timestamp(recording.trading_date, q['source_time_us']).time()
+        whole = books[(0, q['frame'])]
+        raw = toyota.book(at=at, raw=True)
+        assert raw['frame'] == q['frame'] and raw['bid_levels'] == whole[0] and raw['ask_levels'] == whole[1]
+        assert len(raw['bid_levels']) == 15 > len(toyota.quote(at=at)['bids']) == 10
+    view = toyota.book()
+    assert view['asks'][0] == {'price': whole[1][0][0] / 10, 'quantity': whole[1][0][1], 'orders': 1}
+    assert view['closing_bids'] == [] and view['time'] == toyota.quote()['time']
+    assert schema.BOOK_CHANGES not in toyota.quote() and schema.BOOK_CHANGES in toyota.quote(raw=True)
+    plain = tmp_path / 'plain.jsonl'
+    plain.write_bytes(b''.join(schema.encode(b) for b in session_without_changes()))
+    cli.package(plain, tmp_path / 'plain')
+    with pytest.raises(brisk.BriskError, match='no book changes'):
+        brisk.Ticker('7203', brisk.Recording(tmp_path / 'plain')).book()
+
+
+def session_without_changes():
+    from test_spool import session
+    return session(frames=12)
