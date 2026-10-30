@@ -28,7 +28,7 @@ PYBRISK = 'https://raw.githubusercontent.com/obichan117/pybrisk/ca4c77d1553dfd4d
 CAPTURE = (PYBRISK + 'sbi.brisk.jp.har', '59cdf8088b7c0eeac0902d88dbb03f1657fb997667aa2c72ad7df92e0f2adc74')
 # The archive's legacy wire capture: pybrisk's 30,505 binary messages of SBI's stream, 2026-03-11
 # (content addressed; the same bytes as pybrisk's per-message files).
-STREAM = ('https://brisk-recordings-honvl-tokyo.s3.ap-northeast-1.amazonaws.com/archive/20260311/'
+STREAM = ('https://brisk-recordings-honvl-tokyo.s3.ap-northeast-1.amazonaws.com/samples/20260311/'
           'cca870a51e7f96f16009c3709c3f597d314b22ed8922bb3ea7fa1acc67a0f85f/events.jsonl.gz',
           'cca870a51e7f96f16009c3709c3f597d314b22ed8922bb3ea7fa1acc67a0f85f')
 DECODER = {
