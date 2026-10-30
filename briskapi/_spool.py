@@ -44,6 +44,10 @@ PART_BYTES = 64 * 2**20
 # the archive's 100-million-depth-row limit (including a cut's opening book and the last complete part).
 LUNCH_US = 12 * 3600 * 10**6
 MAX_PIECE_ROWS = 80_000_000
+# A piece that could not be packaged (the program did not start, a full disk) is tried again from the same parts, but
+# not at every part written: after RETRY_SECONDS, MAX_ATTEMPTS times in the day, and once more when the day ends.
+RETRY_SECONDS = 300
+MAX_ATTEMPTS = 3
 DEMO_SOURCES = ('historical_mock', 'synthetic_test')   # the same for everyone: nothing to keep
 
 
@@ -100,7 +104,8 @@ class Spool:
         self._readers, self._removed = 0, False
         self._on_part = on_part     # called (on the writer's thread) with the spool after each part is written
         self._shipped, self._cut, self._cut_at, self._index = 0, None, 0, {}
-        self.last_parts, self._last_piece = [], None   # the parts of the piece last tried, and how
+        self.last_parts, self._last_piece = [], None   # the parts of the piece last tried, and how (None: from the bootstrap)
+        self._failed_at, self.attempts = None, 0       # when packaging last failed, and how often since it last succeeded
         self.skipped = []         # (first, last) clock of each piece not made, for the stream gave it no update
 
     @classmethod
@@ -114,7 +119,7 @@ class Spool:
         spool._writer, spool._error, spool._readers, spool._removed = ThreadPoolExecutor(1), None, 0, False
         spool._opened, spool._midnight = time.monotonic(), None
         spool._on_part, spool._cut, spool._cut_at, spool._index, spool.last_parts, spool._last_piece = None, None, 0, {}, [], None
-        spool.skipped = []
+        spool._failed_at, spool.attempts, spool.skipped = None, 0, []
         try:
             spool._shipped = min(int(json.loads((spool.path / 'shipped.json').read_text())['parts']), len(parts))
         except (OSError, ValueError, KeyError, TypeError):
@@ -215,12 +220,17 @@ class Spool:
         part that closed after noon ends the morning (LUNCH_US), or its parts hold MAX_PIECE_ROWS quote updates;
         with `final` (the segment over, its parts all closed) also what is left, ending as the segment did (or,
         with `repair`, with the end its host never wrote). Returns (manifest, repaired), or None when no piece is
-        ready. The parts count as shipped once tried, packaged or not (last_parts names them), so a piece is never
-        shipped twice. A piece the stream sent no update to (a reconnection in the lunch break: its book and the
-        day's history, as the segment before had them) is not made: it is in `skipped`. `progress(label)` is told
-        how its packaging goes (see briskapi._native.package)."""
+        ready. The parts count as shipped once packaged, or refused (brisk-parquet or the archive's rules found the
+        piece wanting: trying again would not help; last_parts names them for keep()), so a piece is never shipped
+        twice. A piece that could not be packaged here and now (the program did not start, a full disk) raises and
+        stays: it is tried again from the same parts, after RETRY_SECONDS, MAX_ATTEMPTS times in the day, and with
+        `final` once more; until then this returns None. A piece the stream sent no update to (a reconnection in the
+        lunch break: its book and the day's history, as the segment before had them) is not made: it is in `skipped`.
+        `progress(label)` is told how its packaging goes (see briskapi._native.package)."""
         if final:
             self.close_part(wait=True)
+        elif self._failed_at is not None and (self.attempts >= MAX_ATTEMPTS or time.monotonic() - self._failed_at < RETRY_SECONDS):
+            return None
         while True:
             parts, last = self._next(self.parts()[self._shipped:], final)
             if parts is None:
@@ -245,11 +255,16 @@ class Spool:
 
     def _package(self, parts, output, last, repair=False, progress=None):
         from briskapi import cli
-        self.last_parts = parts
+        # Until the piece is known whole, what keep() can save of it is the day from its bootstrap through these parts.
+        self.last_parts, self._last_piece = parts, None
         if not parts:
             return None
-        bootstrap = _parquet.bootstrap_row(self.parts()[0])
-        cut = self._cut_state() if self._shipped else None
+        try:
+            bootstrap = _parquet.bootstrap_row(self.parts()[0])
+            cut = self._cut_state() if self._shipped else None
+        except Exception:
+            self._failed()
+            raise
         piece = {'midnight': _parquet.midnight_ns(bootstrap['trading_date']), 'day_start': self.parts()[0],
                  'cut': cut and (cut.state, cut.clock), 'bootstrap': bootstrap,
                  'state_out': self.path / 'cut' / f'{self._shipped + len(parts):06d}.parquet',
@@ -257,11 +272,27 @@ class Spool:
         self._last_piece = piece
         try:
             manifest = cli.package_parts(self.path / _parquet.EQUITY, parts, output, piece=piece, progress=progress)
-            if 'clock' in piece:
-                self._cut, self._cut_at = _Cut(piece['state_out'], piece['clock']), self._shipped + len(parts)
-        finally:
+        except ValueError:   # refused: the piece's parts are tried; keep() may still save their tables
             self._mark(len(parts))
+            self._failed()
+            raise
+        except Exception:    # not packaged here and now: the same parts are tried again later (see ship)
+            self._failed()
+            raise
+        if 'clock' in piece:
+            self._cut, self._cut_at = _Cut(piece['state_out'], piece['clock']), self._shipped + len(parts)
+        self._mark(len(parts))
+        self._failed_at, self.attempts = None, 0
         return manifest, piece.get('repaired', False)
+
+    def _failed(self):
+        self._failed_at, self.attempts = time.monotonic(), self.attempts + 1
+
+    def _whole(self, parts):
+        """A piece of the day from its bootstrap through `parts`' last, with an end if it has none."""
+        bootstrap = _parquet.bootstrap_row(parts[0])
+        return {'midnight': _parquet.midnight_ns(bootstrap['trading_date']), 'day_start': parts[0], 'cut': None,
+                'bootstrap': bootstrap, 'end': 'repair'}
 
     @property
     def piece_start(self):
@@ -303,22 +334,31 @@ class Spool:
         return self._shipped
 
     def keep(self, root, progress=None):
-        """The piece last tried, or else (nothing shipped yet) the segment so far, as a recording (tables, no
-        manifest) in a folder of `root` named after it; None when there is nothing to keep. `progress(label)` is told how
-        packaging it goes (see briskapi._native.package)."""
-        self.close_part(wait=True)
+        """The piece last tried (or, when where the pieces before it left the book could not be found, the day from its
+        bootstrap through the piece's parts), or else (nothing tried yet) the segment so far, its open part closed, as a
+        recording (tables, no manifest) in a folder of `root` named after it; None when there is nothing to keep. The parts
+        kept count as shipped: they are saved. `progress(label)` is told how packaging it goes (see
+        briskapi._native.package)."""
         if self.last_parts:
             piece, parts = self._last_piece, self.last_parts
-        elif not self._shipped and self.parts():
+            if piece is None:
+                parts = self.parts()[:self.parts().index(parts[-1]) + 1]
+                piece = self._whole(parts)
+        elif not self._shipped:
+            self.close_part(wait=True)
             parts = self.parts()
-            bootstrap = _parquet.bootstrap_row(parts[0])
-            piece = {'midnight': _parquet.midnight_ns(bootstrap['trading_date']), 'day_start': parts[0], 'cut': None,
-                     'bootstrap': bootstrap, 'end': 'repair'}
+            if not parts:
+                return None
+            piece = self._whole(parts)
         else:
             return None
         staging = Path(tempfile.mkdtemp(dir=self.path))
-        summary = _native.package(self.path, parts, staging, piece['midnight'], day_start=piece['day_start'], cut=piece['cut'],
-                                  end=piece['end'] or 'repair', threads=_native.threads(), progress=progress)['summary']
+        try:
+            summary = _native.package(self.path, parts, staging, piece['midnight'], day_start=piece['day_start'], cut=piece['cut'],
+                                      end=piece['end'] or 'repair', threads=_native.threads(), progress=progress)['summary']
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         name = local_name(summary, piece['bootstrap'].get('input_transport'))
         target = Path(root) / name
         for n in range(2, 100):
@@ -327,6 +367,7 @@ class Spool:
             target = Path(root) / f'{name}-{n}'
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(staging, target)
+        self._mark(max(0, self.parts().index(parts[-1]) + 1 - self._shipped))
         return target
 
     def remove(self):

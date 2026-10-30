@@ -178,10 +178,11 @@ def project(schema, table, publisher, ts_recv=None, equity=None):
 
 
 def _imbalance(table, head, symbols, equity):
-    """Each update's opening (O) and closing (C) auction state, where BRiSK shows an indicative price."""
-    ids = equity.column('issue_id').to_pylist()
-    upper = dict(zip(ids, pc.cast(equity.column('max_price'), pa.float64()).to_pylist()))
-    lower = dict(zip(ids, pc.cast(equity.column('min_price'), pa.float64()).to_pylist()))
+    """Each update's opening (O) and closing (C) auction state, where BRiSK shows an indicative price. Without the equity
+    table (before a trading day has begun, a gateway answers latest() with no rows) the collars are null."""
+    ids = equity.column('issue_id').to_pylist() if equity is not None else []
+    upper = dict(zip(ids, pc.cast(equity.column('max_price'), pa.float64()).to_pylist())) if ids else {}
+    lower = dict(zip(ids, pc.cast(equity.column('min_price'), pa.float64()).to_pylist())) if ids else {}
     issue = table.column('issue_id').to_pylist()
     parts = []
     for auction, prefix, side in (('O', '', ''), ('C', 'closing_', '_closing')):

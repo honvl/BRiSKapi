@@ -375,9 +375,37 @@ def test_cli_live_says_when_even_keeping_a_failed_save_failed(fake_host, monkeyp
     monkeypatch.setattr(cli, 'package_parts', lambda *a, **k: 1 / 0)
     monkeypatch.setattr(_spool.Spool, 'keep', keep)
     cli.main(['live', '--site', 'sbi', '--no-gateway', '--no-upload', '--output', str(tmp_path / 'days')])
-    told = told_of_the_day(capsys.readouterr().err)
+    err = capsys.readouterr().err
+    told = told_of_the_day(err)
     assert re.fullmatch(rf'Keeping the recording failed after \d+s: {why}', told[-1]), told
     assert not any('saved to' in line for line in told)
+    left, = _spool.spool_root().glob('segment-*')   # nothing of the day was saved: its spool is not deleted
+    assert (left / 'parts').is_dir() and f'its spool is left in {left}' in err
+
+
+def test_a_day_nothing_of_which_could_be_saved_is_finished_by_the_next_feed_from_its_spool(fake_host, monkeypatch, capsys, tmp_path):
+    # Both saves failed (10/23: the program never started on Windows, of too many parts), and `finally: spool.remove()` deleted
+    # the day. Now the spool stays, and the next feed to start finishes it as a crashed session's (Feed._recover).
+    import subprocess as sp
+    monkeypatch.setenv('BRISK_SBI_COOKIES', '{"session_bfaf77a2": "v"}')
+    with pytest.MonkeyPatch.context() as broken:
+        broken.setattr(cli, 'package_parts', lambda *a, **k: 1 / 0)
+        broken.setattr(_spool.Spool, 'keep', lambda self, root, progress=None: 1 // 0)
+        cli.main(['live', '--site', 'sbi', '--no-gateway', '--no-upload', '--output', str(tmp_path / 'days')])
+    err = capsys.readouterr().err
+    left, = _spool.spool_root().glob('segment-*')
+    assert re.search(rf'^Nothing of the recording could be saved; its spool is left in {re.escape(str(left))}, which the next feed '
+                     'to start finishes', err, re.M), err
+    assert not (tmp_path / 'days').exists() and not any(_spool.kept_dir().glob('*'))
+    dead = int(sp.run([sys.executable, '-c', 'import os; print(os.getpid())'], capture_output=True, text=True).stdout)
+    owner = left / 'owner.json'
+    owner.write_text(json.dumps({**json.loads(owner.read_text()), 'pid': dead}))
+    cli.main(['live', '--site', 'sbi', '--no-gateway', '--no-upload', '--output', str(tmp_path / 'days2')])
+    err = capsys.readouterr().err
+    kept = tmp_path / 'days' / 'sbi_20260311_090000-090016'
+    assert re.search(rf'stopped unexpectedly left sbi_20260311_090000-090016 behind: not uploaded, kept in {re.escape(str(kept))}', err), err
+    assert (kept / 'manifest.json').exists() and (tmp_path / 'days2' / 'sbi_20260311_090000-090016' / 'manifest.json').exists()
+    assert not any(_spool.spool_root().glob('segment-*'))
 
 
 def test_a_feed_of_the_api_saves_quietly(fake_host, tmp_path, capsys):

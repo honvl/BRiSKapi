@@ -184,7 +184,12 @@ alone, with a warning), uploads it to the owner's private archive and uploads it
 timing summary, as chosen, then appends its result (`trading_date`, `name`, `path`,
 `uploaded`, `timing_uploaded`, `repaired`, `error`) to `feed.recordings`, calls `on_day(result)` and deletes
 the spool. Packaging (`brisk-parquet package`) reads the parts back, joins their rows and puts them in the canonical order, and writes the same tables as the day's batches at once would;
-`tests/test_native.py` and `tests/test_spool.py` check it. Its manifest's summary is counted as the tables are written
+`tests/test_native.py` and `tests/test_spool.py` check it. The parts' paths go to the program on its standard input
+(`--parts-file -`, a path a line; a file's name reads them from it, and positional parts still work): a day has thousands
+of parts (1,670 by 11:11 of a 135-million-update SBI day, as a part closes after `PART_BYTES` of decoder output, every few
+seconds at the opening), and a Windows command line holds 32,767 characters, about 675 such paths, so listed as arguments
+they did not start the program at all (`[WinError 206]`) and the day was lost (1.8.1). `_native.run` reads the program's
+pipes as bytes and decodes UTF-8, as a text pipe would use the console's code page (cp932 on a Japanese Windows). Its manifest's summary is counted as the tables are written
 (`brisk-parquet` sizes the canonical JSON as it goes) rather than from the archive's checks run here, which took the demo's three
 minutes 35 seconds and would take a day most of an hour: the archive runs them on every upload, and
 an upload it rejects is kept like a failed one.
@@ -214,8 +219,15 @@ real sessions. The [80-million-update synthetic check](docs/benchmarks/package-8
 also covers two packaging processes together, without trades or live feeds, and records the tester's four real sessions. The book the next piece starts from is a Parquet file of the last quote
 of each issue, written with the piece (`cut/`). Its zip is written and hashed on disk (`pack_to`). The worker keeps and uploads each piece as it would a
 day. `shipped.json` counts the parts shipped, so a crashed session's spool is finished from there; where
-the morning left the book is rebuilt from its parts (`brisk-parquet state`). A demo's replay is one recording,
-as its reference requires.
+the morning left the book is rebuilt from its parts (`brisk-parquet state`). A piece's parts count as shipped once it
+is packaged, or refused (brisk-parquet or the archive's rules found it wanting: trying again would not help, and
+`Spool.keep` may still save its tables), or kept. One that could not be packaged here and now (the program did not
+start, a full disk) leaves its parts unshipped: `Spool.ship` tries the same piece again after `RETRY_SECONDS` (five
+minutes), `MAX_ATTEMPTS` (three) times in the day, and once more at the day's end, and says nothing (returns None) at
+the parts written in between. Before, a failed piece counted as shipped and the next attempt came at the next part
+written: a day that failed at 11:11 was retried every 0.7 s until the close, 22,000 times, each closing a part
+(18,000 parts by 15:30) and each rescue (`Spool.keep`) looking for a bootstrap in parts that had none. A demo's replay
+is one recording, as its reference requires.
 
 A save takes minutes, so `brisk live` says how it goes (`cli.Saving`, on stderr, so that `--quotes` keeps stdout to the quotes).
 `brisk-parquet package` tells `progress: package: preparing`, then `package: batches|quotes|trades DONE/TOTAL` (the totals known
@@ -232,7 +244,11 @@ runs. The host, which knows only that a session is over, never says a day is rec
 trading day`): Python says `saved`. Crash recovery (`_recover`) goes through the same `_ship`, so it reports too. A piece that
 failed is rescued into `kept_dir()` by `Feed._rescue` and told afresh (`Saving.keeping`: `keeping what was recorded in ...`; its
 packaging again, if its tables are all there is, reports through `Spool.keep(progress=)`; `saved to` only once the copy exists,
-with the `brisk upload PATH` hint when an upload failed; `Keeping the recording failed ...` if even that does). `brisk record`,
+with the `brisk upload PATH` hint when an upload failed; `Keeping the recording failed ...` if even that does). `Spool.keep`
+saves the piece last tried, or the day from its own bootstrap through that piece's parts when where the pieces before it
+left the book could not be found (`brisk-parquet state` failed: the morning twice rather than the afternoon never), or,
+before any piece was tried, the segment so far with its open part closed; it closes no part of a running day otherwise,
+removes its staging folder when it fails, and counts the parts it kept as shipped. `brisk record`,
 `package` and `upload` report through `Saving` too (`cli._telling`, always on stderr): Python writes their packages, so
 `packaging` has no rows to count, and `saved to` follows only the finished package. The API (`Archive.upload`, `briskapi.record`)
 stays quiet: a progress callback there would be public API.
@@ -266,8 +282,10 @@ segment is dropped, being the same for everyone. Each spool records its session'
 finished the same way by the next feed to start (`_spool.leftovers`, `Feed._recover`): uploaded if
 its session uploaded and uploads are still on, kept in its session's `output`, and dropped if that
 session kept nothing (a gateway's spool only). A segment that fails even so is kept in
-`~/.local/share/brisk/recordings`. `wait()` and `close()` return after the days already finished
-are kept and uploaded.
+`~/.local/share/brisk/recordings`. A day of which a piece could be neither saved nor kept keeps its spool: `_finish_segment`
+removes a spool only when every piece that failed has a `path`, and otherwise warns which folder is left; the next feed to
+start finishes it like a crashed session's (its owner's process gone), and deleting the folder gives the day up. `wait()`
+and `close()` return after the days already finished are kept and uploaded.
 
 ## Live gateway
 

@@ -27,6 +27,18 @@ use crate::error::{Failure, Res, refuse};
 use crate::require;
 use crate::schema;
 
+/// The parts a `--parts-file` names: one path per line, UTF-8, blank lines and a trailing carriage return ignored. A day has
+/// thousands of parts, more than a Windows command line (32,767 characters) holds, so `package` and `state` take them this way.
+pub fn listed(text: &str) -> Vec<PathBuf> {
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// Where a row group's issues lie: the lowest and highest issue ID in it.
 #[derive(Clone, Copy, Debug)]
 pub struct Span {
@@ -419,5 +431,45 @@ impl PartTable {
 
     pub fn rows(&self) -> usize {
         self.spans.iter().map(|s| s.rows).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_parts_file_names_a_path_a_line_however_long() {
+        let paths: Vec<String> = (1..=20_000)
+            .map(|n| format!(r"C:\bd\brisk\spool\segment-422k3fvs\parts\{n:06}"))
+            .collect();
+        let text = paths.join("\n");
+        assert!(text.len() > 32_767, "longer than a Windows command line");
+        let parts = listed(&text);
+        assert_eq!(parts.len(), 20_000);
+        assert_eq!(parts[0], PathBuf::from(&paths[0]));
+        assert_eq!(parts[19_999], PathBuf::from(&paths[19_999]));
+    }
+
+    #[test]
+    fn line_endings_blank_lines_and_a_byte_order_mark_are_not_parts() {
+        let parts = listed("\u{feff}a/1\r\n\nb/2\r\n\r\nc/3\r");
+        assert_eq!(
+            parts,
+            [
+                PathBuf::from("a/1"),
+                PathBuf::from("b/2"),
+                PathBuf::from("c/3")
+            ]
+        );
+        assert!(listed("").is_empty() && listed("\n\r\n").is_empty());
+    }
+
+    #[test]
+    fn paths_keep_their_unicode() {
+        assert_eq!(
+            listed("/data/録画/parts/000001\n"),
+            [PathBuf::from("/data/録画/parts/000001")]
+        );
     }
 }
