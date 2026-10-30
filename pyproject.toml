@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "briskapi"
-version = "1.8.3"
+version = "1.9.0"
 description = "Unofficial Python API and brisk CLI for BRiSK auction data: sign in to your broker's BRiSK (SBI, Tachibana e-shiten, Matsui, Monex, SMBC Nikko) with a passkey, record the live feed through BRiSK's own decoder day after day, keep each day in your own private archive, and query your history and OHLCV bars through the cloud API"
 readme = "README.md"
 license = "MIT"
